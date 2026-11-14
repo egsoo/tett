@@ -64,8 +64,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
-     container:
-      image: ghcr.io/egsoo/tg-video-worker:latest
+    container:
+      image: ghcr.io/egsoo/tett:latest
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
