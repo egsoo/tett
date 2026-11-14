@@ -1,0 +1,38 @@
+# Secrets and local environment
+.env
+*.env
+.env.*
+secrets/
+cookies/
+*cookies*.txt
+*youtube*.txt
+*facebook*.txt
+*.cookie
+*.cookies
+
+# Local backups
+*.zip
+*.7z
+*.tar
+*.tar.gz
+*.bak
+backup/
+backups/
+
+# Runtime files
+work/
+*.log
+*.mp4
+*.m4a
+*.mp3
+*.webm
+*.part
+.package_manifests/*.json
+.package_manifests/*.enc
+!.package_manifests/.gitkeep
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

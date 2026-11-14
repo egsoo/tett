@@ -1,0 +1,605 @@
+name: YouTube Video Local API
+run-name: "AMD4x YouTube Video"
+
+on:
+  workflow_dispatch:
+    inputs:
+      media_url:
+        description: "YouTube URL"
+        required: true
+        type: string
+      max_height:
+        description: "Maximum video height"
+        required: false
+        default: "auto"
+        type: string
+      send_as:
+        description: "Ignored compatibility input"
+        required: false
+        default: "video"
+        type: string
+      output_filename:
+        description: "Ignored compatibility input"
+        required: false
+        type: string
+      progress_chat_id:
+        description: "Telegram progress chat id"
+        required: false
+        type: string
+      progress_message_id:
+        description: "Telegram progress message id"
+        required: false
+        type: string
+      dispatch_key:
+        description: "Dispatch key"
+        required: false
+        default: "manual"
+        type: string
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  youtube_video_send:
+    name: Download YouTube video and send as video
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    container:
+      image: ghcr.io/amd4x/tg-video-worker:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Download YouTube video and send through Local Bot API
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+          YOUTUBE_COOKIES_TXT: ${{ secrets.YOUTUBE_COOKIES_TXT }}
+        run: |
+          set -euo pipefail
+
+          # Load sensitive workflow inputs after the job starts so they do not appear in the Actions env block.
+          get_workflow_input() {
+            local input_name="$1"
+            local fallback_env="${2:-}"
+
+            if [ -n "${GITHUB_ACTIONS:-}" ] && [ -n "${GITHUB_EVENT_PATH:-}" ]; then
+              python3 -c 'import json, os, sys; data=json.load(open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8")); print(((data.get("inputs") or {}).get(sys.argv[1], "") or ""), end="")' "$input_name"
+            elif [ -n "$fallback_env" ]; then
+              printf "%s" "${!fallback_env:-}"
+            fi
+          }
+
+          mask_if_set() {
+            [ -z "${1:-}" ] && return 0
+            local value="$1"
+            value="${value//'%'/'%25'}"
+            value="${value//$'\r'/'%0D'}"
+            value="${value//$'\n'/'%0A'}"
+            echo "::add-mask::$value"
+          }
+
+          MEDIA_URL="$(get_workflow_input media_url MEDIA_URL)"
+          MAX_HEIGHT_INPUT="$(get_workflow_input max_height MAX_HEIGHT_INPUT)"
+          SEND_AS_INPUT="$(get_workflow_input send_as SEND_AS_INPUT)"
+          PROGRESS_CHAT_ID="$(get_workflow_input progress_chat_id PROGRESS_CHAT_ID)"
+          PROGRESS_MESSAGE_ID="$(get_workflow_input progress_message_id PROGRESS_MESSAGE_ID)"
+          DISPATCH_KEY="$(get_workflow_input dispatch_key DISPATCH_KEY)"
+
+          if [ -z "${MEDIA_URL:-}" ]; then
+            echo "ERROR: media_url input is missing."
+            exit 1
+          fi
+
+          mask_if_set "$MEDIA_URL"
+          mask_if_set "$PROGRESS_CHAT_ID"
+          mask_if_set "$PROGRESS_MESSAGE_ID"
+          mask_if_set "$DISPATCH_KEY"
+
+          echo "== YouTube Video Local API =="
+
+          progress_bar() {
+            local percent="$1"
+            local filled=$((percent / 10))
+            local empty=$((10 - filled))
+            local bar=""
+
+            for _ in $(seq 1 "$filled" 2>/dev/null); do
+              bar="${bar}█"
+            done
+
+            for _ in $(seq 1 "$empty" 2>/dev/null); do
+              bar="${bar}░"
+            done
+
+            printf "%s" "$bar"
+          }
+
+          update_progress() {
+            percent="$1"
+            status_text="$2"
+            detail_text="$3"
+
+            if [ -z "${PROGRESS_CHAT_ID:-}" ] || [ -z "${PROGRESS_MESSAGE_ID:-}" ]; then
+              return 0
+            fi
+
+            bar="$(progress_bar "$percent")"
+            run_url="${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-AMD4x/telegram-media-worker}/actions/runs/${GITHUB_RUN_ID:-}"
+
+            text="🐙 <b>GitHub Remote</b>"
+            text="${text}"$'\n\n'"📊 <code>[${bar}] ${percent}%</code>"
+            text="${text}"$'\n'"🧭 <b>Status:</b> ${status_text}"
+            text="${text}"$'\n'"ℹ️ <i>${detail_text}</i>"
+            text="${text}"$'\n'"🆔 <code>${GITHUB_RUN_ID:-unknown}</code>"
+            text="${text}"$'\n'"🔗 <a href=\"${run_url}\">Open Run</a>"
+
+            curl -sS \
+              -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/editMessageText" \
+              -d "chat_id=${PROGRESS_CHAT_ID}" \
+              -d "message_id=${PROGRESS_MESSAGE_ID}" \
+              -d "parse_mode=HTML" \
+              -d "disable_web_page_preview=true" \
+              --data-urlencode "text=${text}" \
+              >/dev/null || true
+          }
+
+          update_completed() {
+            sent_message_id="$1"
+
+            if [ -z "${PROGRESS_CHAT_ID:-}" ] || [ -z "${PROGRESS_MESSAGE_ID:-}" ]; then
+              return 0
+            fi
+
+            run_url="${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-AMD4x/telegram-media-worker}/actions/runs/${GITHUB_RUN_ID:-}"
+
+            text="✅ <b>GitHub YouTube completed.</b>"
+            text="${text}"$'\n\n'"🌐 <b>Platform:</b> <code>YouTube</code>"
+            text="${text}"$'\n'"🧭 <b>Path:</b> <code>github-youtube-video</code>"
+            text="${text}"$'\n'"🎬 <b>Compatibility:</b> <code>Telegram/iPhone ready</code>"
+
+            if [ -n "${sent_message_id:-}" ]; then
+              text="${text}"$'\n'"🆔 <b>Message ID:</b> <code>${sent_message_id}</code>"
+            fi
+
+            text="${text}"$'\n'"🔗 <a href=\"${run_url}\">Open Run</a>"
+
+            curl -sS \
+              -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/editMessageText" \
+              -d "chat_id=${PROGRESS_CHAT_ID}" \
+              -d "message_id=${PROGRESS_MESSAGE_ID}" \
+              -d "parse_mode=HTML" \
+              -d "disable_web_page_preview=true" \
+              --data-urlencode "text=${text}" \
+              >/dev/null || true
+          }
+
+          probe_stream_value() {
+            local file_path="$1"
+            local stream_selector="$2"
+            local entry_name="$3"
+
+            ffprobe -v error \
+              -select_streams "$stream_selector" \
+              -show_entries "stream=${entry_name}" \
+              -of default=noprint_wrappers=1:nokey=1 \
+              "$file_path" 2>/dev/null | head -n 1 || true
+          }
+
+          is_fast_copy_safe_for_iphone() {
+            local file_path="$1"
+
+            if [ ! -f "$file_path" ]; then
+              return 1
+            fi
+
+            local video_codec
+            local audio_codec
+            local pix_fmt
+            local width
+            local height
+            local sar
+            local level
+
+            video_codec="$(probe_stream_value "$file_path" "v:0" "codec_name")"
+            audio_codec="$(probe_stream_value "$file_path" "a:0" "codec_name")"
+            pix_fmt="$(probe_stream_value "$file_path" "v:0" "pix_fmt")"
+            width="$(probe_stream_value "$file_path" "v:0" "width")"
+            height="$(probe_stream_value "$file_path" "v:0" "height")"
+            sar="$(probe_stream_value "$file_path" "v:0" "sample_aspect_ratio")"
+            level="$(probe_stream_value "$file_path" "v:0" "level")"
+
+            [ "$video_codec" = "h264" ] || return 1
+            [ -z "$audio_codec" ] || [ "$audio_codec" = "aac" ] || return 1
+            [ "$pix_fmt" = "yuv420p" ] || return 1
+
+            if [ -n "$sar" ] && [ "$sar" != "1:1" ] && [ "$sar" != "0:1" ]; then
+              return 1
+            fi
+
+            if echo "$width" | grep -Eq '^[0-9]+$' && [ "$width" -gt 1920 ]; then
+              return 1
+            fi
+
+            if echo "$height" | grep -Eq '^[0-9]+$' && [ "$height" -gt 1920 ]; then
+              return 1
+            fi
+
+            if echo "$level" | grep -Eq '^[0-9]+$' && [ "$level" -gt 42 ]; then
+              return 1
+            fi
+
+            return 0
+          }
+
+          remux_fast_for_telegram() {
+            local input_file="$1"
+            local output_file="$2"
+            local log_file="$RUNNER_TEMP/ffmpeg-remux.log"
+
+            if [ ! -f "$input_file" ]; then
+              echo "ERROR: Input media file is missing before remux." >&2
+              return 1
+            fi
+
+            rm -f "$output_file" "$log_file"
+
+            if ! ffmpeg -hide_banner -loglevel error -y \
+              -i "$input_file" \
+              -map 0:v:0 -map 0:a:0? \
+              -map_metadata -1 \
+              -c copy \
+              -tag:v avc1 \
+              -movflags +faststart \
+              "$output_file" > "$log_file" 2>&1; then
+              rm -f "$output_file"
+              echo "ERROR: Fast remux failed." >&2
+              return 1
+            fi
+
+            if [ ! -f "$output_file" ] || [ "$(stat -c%s "$output_file")" -le 0 ]; then
+              rm -f "$output_file"
+              echo "ERROR: Fast remux output is invalid." >&2
+              return 1
+            fi
+
+            printf "%s" "$output_file"
+            return 0
+          }
+
+          transcode_safe_for_iphone() {
+            local input_file="$1"
+            local output_file="$2"
+            local log_file="$RUNNER_TEMP/ffmpeg-transcode.log"
+
+            if [ ! -f "$input_file" ]; then
+              echo "ERROR: Input media file is missing before transcode." >&2
+              return 1
+            fi
+
+            rm -f "$output_file" "$log_file"
+
+            if ! ffmpeg -hide_banner -loglevel error -y \
+              -i "$input_file" \
+              -map 0:v:0 -map 0:a:0? \
+              -map_metadata -1 \
+              -vf "scale=w='if(gte(dar,1),min(1920,trunc(ih*dar/2)*2),-2)':h='if(gte(dar,1),-2,min(1920,trunc(iw/dar/2)*2))':flags=bicubic,setsar=1,format=yuv420p" \
+              -c:v libx264 \
+              -preset ultrafast \
+              -crf 24 \
+              -maxrate 6500k \
+              -bufsize 13000k \
+              -profile:v main \
+              -level 4.1 \
+              -tag:v avc1 \
+              -c:a aac \
+              -b:a 128k \
+              -ar 44100 \
+              -ac 2 \
+              -movflags +faststart \
+              "$output_file" > "$log_file" 2>&1; then
+              rm -f "$output_file"
+              echo "ERROR: Safe transcode failed." >&2
+              return 1
+            fi
+
+            if [ ! -f "$output_file" ] || [ "$(stat -c%s "$output_file")" -le 0 ]; then
+              rm -f "$output_file"
+              echo "ERROR: Safe transcode output is invalid." >&2
+              return 1
+            fi
+
+            printf "%s" "$output_file"
+            return 0
+          }
+
+          prepare_final_video_fast() {
+            local input_file="$1"
+            local remux_file="$2"
+            local transcode_file="$3"
+            local prepared_file=""
+
+            if is_fast_copy_safe_for_iphone "$input_file"; then
+              prepared_file="$(remux_fast_for_telegram "$input_file" "$remux_file" || true)"
+
+              if [ -n "${prepared_file:-}" ] && [ -f "$prepared_file" ] && is_fast_copy_safe_for_iphone "$prepared_file"; then
+                echo "FINAL_PREP_MODE=fast_remux"
+                printf "%s" "$prepared_file"
+                return 0
+              fi
+            fi
+
+            prepared_file="$(transcode_safe_for_iphone "$input_file" "$transcode_file" || true)"
+
+            if [ -n "${prepared_file:-}" ] && [ -f "$prepared_file" ]; then
+              echo "FINAL_PREP_MODE=safe_transcode"
+              printf "%s" "$prepared_file"
+              return 0
+            fi
+
+            return 1
+          }
+
+          if [ -z "${TELEGRAM_TOKEN:-}" ]; then
+            echo "ERROR: TELEGRAM_TOKEN secret is missing."
+            exit 1
+          fi
+
+          if [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
+            echo "ERROR: TELEGRAM_CHAT_ID secret is missing."
+            exit 1
+          fi
+
+          if [ -z "${TELEGRAM_API_ID:-}" ]; then
+            echo "ERROR: TELEGRAM_API_ID secret is missing."
+            exit 1
+          fi
+
+          if [ -z "${TELEGRAM_API_HASH:-}" ]; then
+            echo "ERROR: TELEGRAM_API_HASH secret is missing."
+            exit 1
+          fi
+
+          echo "::add-mask::${TELEGRAM_TOKEN}"
+          echo "::add-mask::${TELEGRAM_CHAT_ID}"
+          echo "::add-mask::${TELEGRAM_API_ID}"
+          echo "::add-mask::${TELEGRAM_API_HASH}"
+
+          LOWER_MEDIA_URL="$(printf "%s" "$MEDIA_URL" | tr "[:upper:]" "[:lower:]")"
+
+          if ! echo "$LOWER_MEDIA_URL" | grep -Eq '(youtube\.com|youtu\.be|music\.youtube\.com)'; then
+            echo "ERROR: This workflow is only for YouTube URLs."
+            exit 1
+          fi
+
+          if ! command -v telegram-bot-api >/dev/null 2>&1; then
+            echo "ERROR: telegram-bot-api is missing from worker image."
+            exit 1
+          fi
+
+          if ! command -v yt-dlp >/dev/null 2>&1 && ! python3 -m yt_dlp --version >/dev/null 2>&1; then
+            echo "ERROR: yt-dlp is missing from worker image."
+            exit 1
+          fi
+
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            echo "ERROR: ffmpeg is missing from worker image."
+            exit 1
+          fi
+
+          if ! command -v ffprobe >/dev/null 2>&1; then
+            echo "ERROR: ffprobe is missing from worker image."
+            exit 1
+          fi
+
+          update_progress 8 "Starting" "Preparing secure media workflow..."
+
+          mkdir -p work
+          mkdir -p "$RUNNER_TEMP/telegram-bot-api"
+
+          COOKIES_ARGS=()
+          if [ -n "${YOUTUBE_COOKIES_TXT:-}" ]; then
+            COOKIES_FILE="$RUNNER_TEMP/youtube-cookies.txt"
+            umask 077
+            printf '%s\n' "$YOUTUBE_COOKIES_TXT" > "$COOKIES_FILE"
+            sed -i 's/\r$//' "$COOKIES_FILE"
+            COOKIES_ARGS=(--cookies "$COOKIES_FILE")
+          fi
+
+          update_progress 12 "Starting Local API" "Preparing upload channel..."
+          echo "== Start Local Bot API =="
+
+          telegram-bot-api \
+            --api-id="${TELEGRAM_API_ID}" \
+            --api-hash="${TELEGRAM_API_HASH}" \
+            --local \
+            --http-ip-address=127.0.0.1 \
+            --http-port=8081 \
+            --dir="$RUNNER_TEMP/telegram-bot-api" \
+            > "$RUNNER_TEMP/telegram-bot-api.log" 2>&1 &
+
+          TELEGRAM_BOT_API_PID="$!"
+
+          cleanup() {
+            kill "$TELEGRAM_BOT_API_PID" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          echo "== Wait for Local Bot API =="
+          BOT_API_READY=0
+
+          for i in $(seq 1 90); do
+            if ! kill -0 "$TELEGRAM_BOT_API_PID" >/dev/null 2>&1; then
+              echo "ERROR: Local Bot API process exited before becoming ready."
+              exit 1
+            fi
+
+            PORT_HTTP_CODE="$(
+              curl -sS \
+                --connect-timeout 1 \
+                --max-time 2 \
+                -o /dev/null \
+                -w "%{http_code}" \
+                "http://127.0.0.1:8081/" 2>/dev/null || true
+            )"
+
+            if [ -n "${PORT_HTTP_CODE:-}" ] && [ "$PORT_HTTP_CODE" != "000" ]; then
+              echo "LOCAL_BOT_API_READY=1"
+              BOT_API_READY=1
+              update_progress 20 "Local API Ready" "Upload channel is ready."
+              break
+            fi
+
+            sleep 1
+          done
+
+          if [ "$BOT_API_READY" != "1" ]; then
+            echo "ERROR: Local Bot API did not become ready."
+            exit 1
+          fi
+
+          NORMALIZED_MAX_HEIGHT="$(printf '%s' "${MAX_HEIGHT_INPUT:-auto}" | tr '[:upper:]' '[:lower:]')"
+
+          if [ "$NORMALIZED_MAX_HEIGHT" != "auto" ] && ! echo "$NORMALIZED_MAX_HEIGHT" | grep -Eq '^[0-9]+$'; then
+            NORMALIZED_MAX_HEIGHT="auto"
+          fi
+
+          if [ "$NORMALIZED_MAX_HEIGHT" = "auto" ]; then
+            YOUTUBE_TARGET_HEIGHT="2160"
+          else
+            YOUTUBE_TARGET_HEIGHT="$NORMALIZED_MAX_HEIGHT"
+          fi
+
+          YOUTUBE_FORMAT_SELECTOR="bv*[ext=mp4][vcodec^=avc1][height<=${YOUTUBE_TARGET_HEIGHT}]+ba[ext=m4a]/b[ext=mp4][vcodec^=avc1][acodec^=mp4a][height<=${YOUTUBE_TARGET_HEIGHT}]/bv*[height<=${YOUTUBE_TARGET_HEIGHT}]+ba/bestvideo[height<=${YOUTUBE_TARGET_HEIGHT}]+bestaudio/best[height<=${YOUTUBE_TARGET_HEIGHT}]/best"
+
+          update_progress 30 "Processing" "Preparing media safely..."
+          echo "== Processing media securely =="
+
+          YTDLP_LOG="$RUNNER_TEMP/yt-dlp.log"
+
+          if ! python3 -m yt_dlp \
+            "${COOKIES_ARGS[@]}" \
+            --quiet \
+            --no-warnings \
+            --no-progress \
+            --no-playlist \
+            --no-write-info-json \
+            --no-write-thumbnail \
+            --no-write-description \
+            --no-write-comments \
+            --no-cache-dir \
+            --no-part \
+            --restrict-filenames \
+            --extractor-args "youtube:player_client=web_safari,web" \
+            -f "$YOUTUBE_FORMAT_SELECTOR" \
+            --merge-output-format mp4 \
+            -o "work/youtube_video.%(ext)s" \
+            "$MEDIA_URL" > "$YTDLP_LOG" 2>&1; then
+            echo "ERROR: Media processing failed."
+            exit 1
+          fi
+
+          update_progress 68 "Preparing" "Checking final media compatibility..."
+
+          MEDIA_FILE="$(find work -maxdepth 1 -type f -name 'youtube_video.mp4' | head -n 1)"
+
+          if [ -z "$MEDIA_FILE" ]; then
+            MEDIA_FILE="$(find work -maxdepth 1 -type f -name 'youtube_video.*' | sort | head -n 1)"
+          fi
+
+          if [ -z "$MEDIA_FILE" ] || [ ! -f "$MEDIA_FILE" ]; then
+            echo "ERROR: Processed media file was not found."
+            exit 1
+          fi
+
+          update_progress 74 "Preparing" "Optimizing media for Telegram/iPhone..."
+
+          PREPARED_FILE="$(prepare_final_video_fast "$MEDIA_FILE" "work/youtube_telegram_fast.mp4" "work/youtube_telegram_safe.mp4" | tail -n 1 || true)"
+
+          if [ -z "${PREPARED_FILE:-}" ] || [ ! -f "$PREPARED_FILE" ]; then
+            echo "ERROR: Failed to prepare Telegram/iPhone-compatible media file."
+            exit 1
+          fi
+
+          MEDIA_FILE="$PREPARED_FILE"
+          SIZE_BYTES="$(stat -c%s "$MEDIA_FILE")"
+
+          VIDEO_WIDTH="$(probe_stream_value "$MEDIA_FILE" "v:0" "width")"
+          VIDEO_HEIGHT="$(probe_stream_value "$MEDIA_FILE" "v:0" "height")"
+
+          if ! echo "${VIDEO_WIDTH:-}" | grep -Eq '^[0-9]+$'; then
+            VIDEO_WIDTH=""
+          fi
+
+          if ! echo "${VIDEO_HEIGHT:-}" | grep -Eq '^[0-9]+$'; then
+            VIDEO_HEIGHT=""
+          fi
+
+          echo "MEDIA_FILE_READY=1"
+          echo "TELEGRAM_IPHONE_READY=1"
+          echo "VIDEO_DIMENSIONS_READY=1"
+
+          if [ "$SIZE_BYTES" -le 0 ]; then
+            echo "ERROR: Final media file is empty."
+            exit 1
+          fi
+
+          if [ "$SIZE_BYTES" -gt 2000000000 ]; then
+            echo "ERROR: File is larger than 2000MB Local Bot API limit."
+            exit 1
+          fi
+
+          update_progress 82 "Uploading" "Uploading final media to Telegram..."
+          echo "== Send final media =="
+
+          SEND_VIDEO_FORM_ARGS=(
+            -F "chat_id=${TELEGRAM_CHAT_ID}"
+            -F "supports_streaming=true"
+            -F "video=@${MEDIA_FILE}"
+          )
+
+          if [ -n "${VIDEO_WIDTH:-}" ] && [ -n "${VIDEO_HEIGHT:-}" ]; then
+            SEND_VIDEO_FORM_ARGS+=(
+              -F "width=${VIDEO_WIDTH}"
+              -F "height=${VIDEO_HEIGHT}"
+            )
+          fi
+
+          HTTP_CODE="$(curl -sS \
+            --connect-timeout 20 \
+            --max-time 7200 \
+            -o "$RUNNER_TEMP/send-video-response.json" \
+            -w "%{http_code}" \
+            -X POST "http://127.0.0.1:8081/bot${TELEGRAM_TOKEN}/sendVideo" \
+            "${SEND_VIDEO_FORM_ARGS[@]}")"
+
+          echo "TELEGRAM_SEND_ATTEMPTED=1"
+          echo "TELEGRAM_HTTP_CODE=${HTTP_CODE}"
+
+          if ! echo "$HTTP_CODE" | grep -Eq '^2'; then
+            TELEGRAM_ERROR_DESC="$(python3 -c 'import json,sys; data=json.load(open(sys.argv[1], encoding="utf-8")); print(str(data.get("description") or "sendVideo failed")[:300])' "$RUNNER_TEMP/send-video-response.json" 2>/dev/null || printf '%s' 'sendVideo failed without JSON response')"
+            echo "ERROR: sendVideo failed. HTTP=${HTTP_CODE}. ${TELEGRAM_ERROR_DESC}"
+            exit 1
+          fi
+
+          if ! grep -q '"ok":true' "$RUNNER_TEMP/send-video-response.json"; then
+            TELEGRAM_ERROR_DESC="$(python3 -c 'import json,sys; data=json.load(open(sys.argv[1], encoding="utf-8")); print(str(data.get("description") or "Telegram returned non-ok response")[:300])' "$RUNNER_TEMP/send-video-response.json" 2>/dev/null || printf '%s' 'Telegram returned non-ok response without JSON details')"
+            echo "ERROR: Telegram returned non-ok response. ${TELEGRAM_ERROR_DESC}"
+            exit 1
+          fi
+
+          echo "TELEGRAM_SEND_COMPLETED=1"
+
+          TELEGRAM_SENT_MESSAGE_ID="$(python3 -c 'import json,sys; print((json.load(open(sys.argv[1], encoding="utf-8")).get("result") or {}).get("message_id") or "")' "$RUNNER_TEMP/send-video-response.json" 2>/dev/null || true)"
+
+          update_completed "$TELEGRAM_SENT_MESSAGE_ID"
+          echo "OK: Final media was sent successfully."

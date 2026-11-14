@@ -1,0 +1,237 @@
+name: Package Inspector
+run-name: "AMD4x Package Inspect"
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_url:
+        description: "ZIP/RAR/7z/direct file/torrent/magnet/directory listing/URL list"
+        required: true
+        type: string
+      progress_chat_id:
+        description: "Telegram progress chat id"
+        required: false
+        type: string
+      progress_message_id:
+        description: "Telegram progress message id"
+        required: false
+        type: string
+      dispatch_key:
+        description: "Dispatch key for bot-side correlation"
+        required: false
+        default: "manual"
+        type: string
+      send_telegram:
+        description: "Send package inspection report to Telegram"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+permissions:
+  contents: write
+  packages: read
+  actions: read
+
+jobs:
+  package_inspect:
+    name: Inspect package source
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    container:
+      image: ghcr.io/amd4x/tg-video-worker:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Prepare package tools
+        run: |
+          set -euo pipefail
+          if command -v apt-get >/dev/null 2>&1; then
+            apt-get update
+            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends aria2 p7zip-full libarchive-tools unrar-free unzip ca-certificates openssl
+          fi
+          python3 --version
+          aria2c --version | head -n 1 || true
+          7z | head -n 2 || true
+
+      - name: Inspect package source
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          ADMIN_ID: ${{ secrets.ADMIN_ID }}
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+        run: |
+          set -euo pipefail
+          mkdir -p work/package-inspect
+
+          # Load sensitive workflow inputs after the job starts so they do not appear in the Actions env block.
+          get_workflow_input() {
+            local input_name="$1"
+            local fallback_env="${2:-}"
+
+            if [ -n "${GITHUB_ACTIONS:-}" ] && [ -n "${GITHUB_EVENT_PATH:-}" ]; then
+              python3 -c 'import json, os, sys; data=json.load(open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8")); print(((data.get("inputs") or {}).get(sys.argv[1], "") or ""), end="")' "$input_name"
+            elif [ -n "$fallback_env" ]; then
+              printf "%s" "${!fallback_env:-}"
+            fi
+          }
+
+          mask_if_set() {
+            [ -z "${1:-}" ] && return 0
+            local value="$1"
+            value="${value//'%'/'%25'}"
+            value="${value//$'\r'/'%0D'}"
+            value="${value//$'\n'/'%0A'}"
+            echo "::add-mask::$value"
+          }
+
+          SOURCE_URL="$(get_workflow_input source_url SOURCE_URL)"
+          PROGRESS_CHAT_ID="$(get_workflow_input progress_chat_id PROGRESS_CHAT_ID)"
+          PROGRESS_MESSAGE_ID="$(get_workflow_input progress_message_id PROGRESS_MESSAGE_ID)"
+          DISPATCH_KEY="$(get_workflow_input dispatch_key DISPATCH_KEY)"
+          SEND_TELEGRAM="$(get_workflow_input send_telegram SEND_TELEGRAM)"
+
+          mask_if_set "$SOURCE_URL"
+          mask_if_set "$PROGRESS_CHAT_ID"
+          mask_if_set "$PROGRESS_MESSAGE_ID"
+          mask_if_set "$DISPATCH_KEY"
+          [ -n "${TELEGRAM_TOKEN:-}" ] && echo "::add-mask::${TELEGRAM_TOKEN}"
+          [ -n "${TELEGRAM_CHAT_ID:-}" ] && echo "::add-mask::${TELEGRAM_CHAT_ID}"
+          [ -n "${ADMIN_ID:-}" ] && echo "::add-mask::${ADMIN_ID}"
+
+          python3 scripts/package_tools/inspect.py \
+            --source-url "$SOURCE_URL" \
+            --dispatch-key "${DISPATCH_KEY:-manual}" \
+            --progress-chat-id "${PROGRESS_CHAT_ID:-}" \
+            --progress-message-id "${PROGRESS_MESSAGE_ID:-}" \
+            --work-dir "work/package-inspect" \
+            --manifest-out "manifest.json" \
+            --send-telegram "${SEND_TELEGRAM:-true}"
+
+      - name: Publish encrypted manifest for bot
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
+          PACKAGE_MANIFEST_KEY: ${{ secrets.PACKAGE_MANIFEST_KEY }}
+        run: |
+          set -euo pipefail
+          # Load sensitive workflow inputs after the job starts so they do not appear in the Actions env block.
+          get_workflow_input() {
+            local input_name="$1"
+            local fallback_env="${2:-}"
+
+            if [ -n "${GITHUB_ACTIONS:-}" ] && [ -n "${GITHUB_EVENT_PATH:-}" ]; then
+              python3 -c 'import json, os, sys; data=json.load(open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8")); print(((data.get("inputs") or {}).get(sys.argv[1], "") or ""), end="")' "$input_name"
+            elif [ -n "$fallback_env" ]; then
+              printf "%s" "${!fallback_env:-}"
+            fi
+          }
+
+          mask_if_set() {
+            [ -z "${1:-}" ] && return 0
+            local value="$1"
+            value="${value//'%'/'%25'}"
+            value="${value//$'\r'/'%0D'}"
+            value="${value//$'\n'/'%0A'}"
+            echo "::add-mask::$value"
+          }
+
+          DISPATCH_KEY="$(get_workflow_input dispatch_key DISPATCH_KEY)"
+          DISPATCH_KEY="${DISPATCH_KEY:-manual}"
+
+          mask_if_set "$DISPATCH_KEY"
+          [ -n "${PACKAGE_MANIFEST_KEY:-}" ] && echo "::add-mask::${PACKAGE_MANIFEST_KEY}"
+
+          export DISPATCH_KEY
+
+          if [ -z "${PACKAGE_MANIFEST_KEY:-}" ]; then
+            echo "PACKAGE_MANIFEST_KEY_MISSING=1"
+            exit 1
+          fi
+
+          openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 \
+            -salt \
+            -pass env:PACKAGE_MANIFEST_KEY \
+            -in manifest.json \
+            -out manifest.enc
+
+          python3 - <<'PY'
+          import base64
+          import json
+          import os
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          token = os.environ["GITHUB_TOKEN"]
+          repo = os.environ["REPOSITORY"]
+          ref_name = os.environ.get("REF_NAME") or "main"
+          dispatch_key = os.environ.get("DISPATCH_KEY") or "manual"
+
+          safe_key = "".join(
+              c if c.isalnum() or c in "._-" else "_"
+              for c in dispatch_key
+          )[:160] or "manual"
+
+          path = f".package_manifests/{safe_key}.enc"
+
+          with open("manifest.enc", "rb") as f:
+              content_b64 = base64.b64encode(f.read()).decode("ascii")
+
+          api_base = f"https://api.github.com/repos/{repo}/contents/{urllib.parse.quote(path)}"
+
+          headers = {
+              "Authorization": f"Bearer {token}",
+              "Accept": "application/vnd.github+json",
+              "X-GitHub-Api-Version": "2022-11-28",
+              "User-Agent": "AMD4x-Package-Manifest-Publisher",
+          }
+
+          sha = None
+          get_url = f"{api_base}?ref={urllib.parse.quote(ref_name)}"
+          req = urllib.request.Request(get_url, headers=headers, method="GET")
+
+          try:
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  existing = json.loads(resp.read().decode("utf-8"))
+                  sha = existing.get("sha")
+          except urllib.error.HTTPError as e:
+              if e.code != 404:
+                  raise
+
+          payload = {
+              "message": "Store package manifest",
+              "content": content_b64,
+              "branch": ref_name,
+          }
+
+          if sha:
+              payload["sha"] = sha
+
+          body = json.dumps(payload).encode("utf-8")
+          put_req = urllib.request.Request(
+              api_base,
+              data=body,
+              headers={**headers, "Content-Type": "application/json"},
+              method="PUT",
+          )
+
+          with urllib.request.urlopen(put_req, timeout=45) as resp:
+              json.loads(resp.read().decode("utf-8"))
+
+          print("MANIFEST_STORE_OK=1")
+          PY

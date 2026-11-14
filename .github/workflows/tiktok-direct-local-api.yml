@@ -1,0 +1,759 @@
+name: TikTok Direct Local API
+run-name: "AMD4x TikTok Direct"
+
+on:
+  workflow_dispatch:
+    inputs:
+      media_url:
+        description: "TikTok URL"
+        required: true
+        type: string
+      max_height:
+        description: "Maximum video height"
+        required: false
+        default: "auto"
+        type: string
+      send_as:
+        description: "Ignored compatibility input"
+        required: false
+        default: "video"
+        type: string
+      output_filename:
+        description: "Ignored compatibility input"
+        required: false
+        type: string
+      progress_chat_id:
+        description: "Telegram progress chat id"
+        required: false
+        type: string
+      progress_message_id:
+        description: "Telegram progress message id"
+        required: false
+        type: string
+      dispatch_key:
+        description: "Dispatch key"
+        required: false
+        default: "manual"
+        type: string
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  tiktok_direct_send:
+    name: Download TikTok video and send as video
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    container:
+      image: ghcr.io/amd4x/tg-video-worker:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Download TikTok video and send through Local Bot API
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+        run: |
+          set -euo pipefail
+
+          # Load sensitive workflow inputs after the job starts so they do not appear in the Actions env block.
+          get_workflow_input() {
+            local input_name="$1"
+            local fallback_env="${2:-}"
+
+            if [ -n "${GITHUB_ACTIONS:-}" ] && [ -n "${GITHUB_EVENT_PATH:-}" ]; then
+              python3 -c 'import json, os, sys; data=json.load(open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8")); print(((data.get("inputs") or {}).get(sys.argv[1], "") or ""), end="")' "$input_name"
+            elif [ -n "$fallback_env" ]; then
+              printf "%s" "${!fallback_env:-}"
+            fi
+          }
+
+          mask_if_set() {
+            [ -z "${1:-}" ] && return 0
+            local value="$1"
+            value="${value//'%'/'%25'}"
+            value="${value//$'\r'/'%0D'}"
+            value="${value//$'\n'/'%0A'}"
+            echo "::add-mask::$value"
+          }
+
+          MEDIA_URL="$(get_workflow_input media_url MEDIA_URL)"
+          MAX_HEIGHT_INPUT="$(get_workflow_input max_height MAX_HEIGHT_INPUT)"
+          PROGRESS_CHAT_ID="$(get_workflow_input progress_chat_id PROGRESS_CHAT_ID)"
+          PROGRESS_MESSAGE_ID="$(get_workflow_input progress_message_id PROGRESS_MESSAGE_ID)"
+          DISPATCH_KEY="$(get_workflow_input dispatch_key DISPATCH_KEY)"
+
+          if [ -z "${MEDIA_URL:-}" ]; then
+            echo "ERROR: media_url input is missing."
+            exit 1
+          fi
+
+          mask_if_set "$MEDIA_URL"
+          mask_if_set "$PROGRESS_CHAT_ID"
+          mask_if_set "$PROGRESS_MESSAGE_ID"
+          mask_if_set "$DISPATCH_KEY"
+
+          echo "== TikTok Direct Local API =="
+
+          progress_bar() {
+            local percent="$1"
+            local filled=$((percent / 10))
+            local empty=$((10 - filled))
+            local bar=""
+
+            for _ in $(seq 1 "$filled" 2>/dev/null); do
+              bar="${bar}█"
+            done
+
+            for _ in $(seq 1 "$empty" 2>/dev/null); do
+              bar="${bar}░"
+            done
+
+            printf "%s" "$bar"
+          }
+
+          update_progress() {
+            percent="$1"
+            status_text="$2"
+            detail_text="$3"
+
+            if [ -z "${PROGRESS_CHAT_ID:-}" ] || [ -z "${PROGRESS_MESSAGE_ID:-}" ]; then
+              return 0
+            fi
+
+            bar="$(progress_bar "$percent")"
+            run_url="${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-AMD4x/telegram-media-worker}/actions/runs/${GITHUB_RUN_ID:-}"
+
+            text="🐙 <b>GitHub Remote</b>"
+            text="${text}"$'\n\n'"📊 <code>[${bar}] ${percent}%</code>"
+            text="${text}"$'\n'"🧭 <b>Status:</b> ${status_text}"
+            text="${text}"$'\n'"ℹ️ <i>${detail_text}</i>"
+            text="${text}"$'\n'"🆔 <code>${GITHUB_RUN_ID:-unknown}</code>"
+            text="${text}"$'\n'"🔗 <a href=\"${run_url}\">Open Run</a>"
+
+            curl -sS \
+              -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/editMessageText" \
+              -d "chat_id=${PROGRESS_CHAT_ID}" \
+              -d "message_id=${PROGRESS_MESSAGE_ID}" \
+              -d "parse_mode=HTML" \
+              -d "disable_web_page_preview=true" \
+              --data-urlencode "text=${text}" \
+              >/dev/null || true
+          }
+
+          update_completed() {
+            sent_message_id="$1"
+
+            if [ -z "${PROGRESS_CHAT_ID:-}" ] || [ -z "${PROGRESS_MESSAGE_ID:-}" ]; then
+              return 0
+            fi
+
+            run_url="${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-AMD4x/telegram-media-worker}/actions/runs/${GITHUB_RUN_ID:-}"
+
+            text="✅ <b>GitHub TikTok Direct completed.</b>"
+            text="${text}"$'\n\n'"🌐 <b>Platform:</b> <code>TikTok</code>"
+            text="${text}"$'\n'"🧭 <b>Path:</b> <code>github-tiktok-direct</code>"
+
+            if [ -n "${sent_message_id:-}" ]; then
+              text="${text}"$'\n'"🆔 <b>Message ID:</b> <code>${sent_message_id}</code>"
+            fi
+
+            text="${text}"$'\n'"🔗 <a href=\"${run_url}\">Open Run</a>"
+
+            curl -sS \
+              -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/editMessageText" \
+              -d "chat_id=${PROGRESS_CHAT_ID}" \
+              -d "message_id=${PROGRESS_MESSAGE_ID}" \
+              -d "parse_mode=HTML" \
+              -d "disable_web_page_preview=true" \
+              --data-urlencode "text=${text}" \
+              >/dev/null || true
+          }
+
+          if [ -z "${TELEGRAM_TOKEN:-}" ]; then
+            echo "ERROR: TELEGRAM_TOKEN secret is missing."
+            exit 1
+          fi
+
+          if [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
+            echo "ERROR: TELEGRAM_CHAT_ID secret is missing."
+            exit 1
+          fi
+
+          if [ -z "${TELEGRAM_API_ID:-}" ]; then
+            echo "ERROR: TELEGRAM_API_ID secret is missing."
+            exit 1
+          fi
+
+          if [ -z "${TELEGRAM_API_HASH:-}" ]; then
+            echo "ERROR: TELEGRAM_API_HASH secret is missing."
+            exit 1
+          fi
+
+          echo "::add-mask::${TELEGRAM_TOKEN}"
+          echo "::add-mask::${TELEGRAM_CHAT_ID}"
+          echo "::add-mask::${TELEGRAM_API_ID}"
+          echo "::add-mask::${TELEGRAM_API_HASH}"
+
+          LOWER_MEDIA_URL="$(printf "%s" "$MEDIA_URL" | tr "[:upper:]" "[:lower:]")"
+
+          if ! echo "$LOWER_MEDIA_URL" | grep -Eq '(tiktok\.com|vm\.tiktok\.com|vt\.tiktok\.com)'; then
+            echo "ERROR: This workflow is only for TikTok URLs."
+            exit 1
+          fi
+
+          if ! command -v telegram-bot-api >/dev/null 2>&1; then
+            echo "ERROR: telegram-bot-api is missing from worker image."
+            exit 1
+          fi
+
+          if ! command -v yt-dlp >/dev/null 2>&1 && ! python3 -m yt_dlp --version >/dev/null 2>&1; then
+            echo "ERROR: yt-dlp is missing from worker image."
+            exit 1
+          fi
+
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            echo "ERROR: ffmpeg is missing from worker image."
+            exit 1
+          fi
+
+          if ! command -v ffprobe >/dev/null 2>&1; then
+            echo "ERROR: ffprobe is missing from worker image."
+            exit 1
+          fi
+
+          update_progress 8 "Starting" "Preparing TikTok Direct workflow..."
+
+          mkdir -p work
+          mkdir -p "$RUNNER_TEMP/telegram-bot-api"
+
+          update_progress 12 "Starting Local API" "Starting Telegram Local Bot API..."
+          echo "== Start Local Bot API =="
+
+          telegram-bot-api \
+            --api-id="${TELEGRAM_API_ID}" \
+            --api-hash="${TELEGRAM_API_HASH}" \
+            --local \
+            --http-ip-address=127.0.0.1 \
+            --http-port=8081 \
+            --dir="$RUNNER_TEMP/telegram-bot-api" \
+            > "$RUNNER_TEMP/telegram-bot-api.log" 2>&1 &
+
+          TELEGRAM_BOT_API_PID="$!"
+
+          cleanup() {
+            kill "$TELEGRAM_BOT_API_PID" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          echo "== Wait for Local Bot API =="
+          BOT_API_READY=0
+
+          for i in $(seq 1 90); do
+            if ! kill -0 "$TELEGRAM_BOT_API_PID" >/dev/null 2>&1; then
+              echo "ERROR: Local Bot API process exited before becoming ready."
+              exit 1
+            fi
+
+            PORT_HTTP_CODE="$(
+              curl -sS \
+                --connect-timeout 1 \
+                --max-time 2 \
+                -o /dev/null \
+                -w "%{http_code}" \
+                "http://127.0.0.1:8081/" 2>/dev/null || true
+            )"
+
+            if [ -n "${PORT_HTTP_CODE:-}" ] && [ "$PORT_HTTP_CODE" != "000" ]; then
+              echo "LOCAL_BOT_API_READY=1"
+              BOT_API_READY=1
+              update_progress 20 "Local API Ready" "Telegram Local Bot API is ready."
+              break
+            fi
+
+            sleep 1
+          done
+
+          if [ "$BOT_API_READY" != "1" ]; then
+            echo "ERROR: Local Bot API did not become ready."
+            exit 1
+          fi
+
+          NORMALIZED_MAX_HEIGHT="$(printf '%s' "${MAX_HEIGHT_INPUT:-auto}" | tr '[:upper:]' '[:lower:]')"
+
+          if [ "$NORMALIZED_MAX_HEIGHT" != "auto" ] && ! echo "$NORMALIZED_MAX_HEIGHT" | grep -Eq '^[0-9]+$'; then
+            NORMALIZED_MAX_HEIGHT="auto"
+          fi
+
+          if [ "$NORMALIZED_MAX_HEIGHT" = "auto" ]; then
+            TIKTOK_FORMAT_SELECTOR="best[ext=mp4][vcodec!=none][acodec!=none]/best[vcodec!=none][acodec!=none]/bestvideo[ext=mp4]+bestaudio/bestvideo+bestaudio/best[ext=mp4]/best"
+          else
+            TIKTOK_FORMAT_SELECTOR="best[ext=mp4][height<=${NORMALIZED_MAX_HEIGHT}][vcodec!=none][acodec!=none]/best[height<=${NORMALIZED_MAX_HEIGHT}][vcodec!=none][acodec!=none]/bestvideo[height<=${NORMALIZED_MAX_HEIGHT}]+bestaudio/best[ext=mp4][height<=${NORMALIZED_MAX_HEIGHT}]/best[height<=${NORMALIZED_MAX_HEIGHT}]/best"
+          fi
+
+          media_has_audio_stream() {
+            local file_path="$1"
+
+            if [ ! -f "$file_path" ]; then
+              return 1
+            fi
+
+            local audio_count
+            audio_count="$(
+              ffprobe -v error \
+                -select_streams a \
+                -show_entries stream=index \
+                -of csv=p=0 \
+                "$file_path" 2>/dev/null | grep -c . || true
+            )"
+
+            [ "${audio_count:-0}" -gt 0 ]
+          }
+
+          media_has_video_stream() {
+            local file_path="$1"
+
+            if [ ! -f "$file_path" ]; then
+              return 1
+            fi
+
+            local video_count
+            video_count="$(
+              ffprobe -v error \
+                -select_streams v \
+                -show_entries stream=index \
+                -of csv=p=0 \
+                "$file_path" 2>/dev/null | grep -c . || true
+            )"
+
+            [ "${video_count:-0}" -gt 0 ]
+          }
+
+          media_is_telegram_video_compatible() {
+            local file_path="$1"
+
+            if [ ! -f "$file_path" ]; then
+              return 1
+            fi
+
+            local video_codec
+            local audio_codec
+
+            video_codec="$(
+              ffprobe -v error \
+                -select_streams v:0 \
+                -show_entries stream=codec_name \
+                -of default=noprint_wrappers=1:nokey=1 \
+                "$file_path" 2>/dev/null | head -n 1 || true
+            )"
+
+            audio_codec="$(
+              ffprobe -v error \
+                -select_streams a:0 \
+                -show_entries stream=codec_name \
+                -of default=noprint_wrappers=1:nokey=1 \
+                "$file_path" 2>/dev/null | head -n 1 || true
+            )"
+
+            [ "$video_codec" = "h264" ] && [ "$audio_codec" = "aac" ]
+          }
+
+          remux_to_mp4_if_needed() {
+            local input_file="$1"
+            local output_file="$2"
+
+            if [ ! -f "$input_file" ]; then
+              return 1
+            fi
+
+            rm -f "$output_file"
+
+            if ! ffmpeg -hide_banner -loglevel error -y \
+              -i "$input_file" \
+              -map 0:v:0 -map 0:a:0 \
+              -c copy \
+              -movflags +faststart \
+              "$output_file"; then
+              rm -f "$output_file"
+              return 1
+            fi
+
+            if [ ! -f "$output_file" ]; then
+              return 1
+            fi
+
+            printf "%s" "$output_file"
+            return 0
+          }
+
+          transcode_to_telegram_video() {
+            local input_file="$1"
+            local output_file="$2"
+
+            if [ ! -f "$input_file" ]; then
+              return 1
+            fi
+
+            rm -f "$output_file"
+
+            if ! ffmpeg -hide_banner -loglevel error -y \
+              -i "$input_file" \
+              -map 0:v:0 -map 0:a:0 \
+              -vf "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p" \
+              -c:v libx264 \
+              -preset veryfast \
+              -crf 23 \
+              -c:a aac \
+              -b:a 128k \
+              -ar 44100 \
+              -ac 2 \
+              -movflags +faststart \
+              "$output_file"; then
+              rm -f "$output_file"
+              return 1
+            fi
+
+            if [ ! -f "$output_file" ]; then
+              return 1
+            fi
+
+            printf "%s" "$output_file"
+            return 0
+          }
+
+          download_tiktok_candidate() {
+            local attempt_label="$1"
+            local format_selector="$2"
+            local sort_expr="${3:-}"
+
+            rm -f work/tiktok_video.*
+            YTDLP_LOG="$RUNNER_TEMP/yt-dlp-${attempt_label}.log"
+
+            echo "ATTEMPT=${attempt_label}"
+            update_progress 30 "Downloading" "Downloading TikTok video with audio..."
+
+            SORT_ARGS=()
+            if [ -n "$sort_expr" ]; then
+              SORT_ARGS=(-S "$sort_expr")
+            fi
+
+            if ! python3 -m yt_dlp \
+              --quiet \
+              --no-warnings \
+              --no-progress \
+              --no-playlist \
+              --no-write-info-json \
+              --no-write-thumbnail \
+              --no-write-description \
+              --no-write-comments \
+              --no-cache-dir \
+              --no-part \
+              --restrict-filenames \
+              --geo-bypass \
+              --socket-timeout 10 \
+              --retries 1 \
+              --fragment-retries 1 \
+              --concurrent-fragments 4 \
+              --merge-output-format mp4 \
+              --remux-video mp4 \
+              --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+              --referer "https://www.tiktok.com/" \
+              --add-header "Accept-Language:en-US,en;q=0.9" \
+              "${SORT_ARGS[@]}" \
+              -f "$format_selector" \
+              -o "work/tiktok_video.%(ext)s" \
+              "$MEDIA_URL" > "$YTDLP_LOG" 2>&1; then
+              echo "DOWNLOAD_ATTEMPT_FAILED=1"
+              return 1
+            fi
+
+            CANDIDATE_FILE="$(find work -maxdepth 1 -type f -name 'tiktok_video.*' | sort | head -n 1)"
+
+            if [ -z "${CANDIDATE_FILE:-}" ] || [ ! -f "$CANDIDATE_FILE" ]; then
+              echo "DOWNLOAD_OUTPUT_MISSING=1"
+              return 1
+            fi
+
+            if ! media_has_video_stream "$CANDIDATE_FILE"; then
+              echo "TIKTOK_NO_VIDEO_STREAM=1"
+              rm -f "$CANDIDATE_FILE"
+              return 1
+            fi
+
+            if ! media_has_audio_stream "$CANDIDATE_FILE"; then
+              echo "TIKTOK_NO_AUDIO_STREAM=1"
+              rm -f "$CANDIDATE_FILE"
+              return 1
+            fi
+
+            if ! media_is_telegram_video_compatible "$CANDIDATE_FILE"; then
+              echo "TIKTOK_UNSUPPORTED_CODEC=1"
+
+              if [ -z "${TRANSCODE_SOURCE_FILE:-}" ]; then
+                TRANSCODE_SOURCE_FILE="work/tiktok_transcode_source_${attempt_label}.mp4"
+                rm -f "$TRANSCODE_SOURCE_FILE"
+                mv "$CANDIDATE_FILE" "$TRANSCODE_SOURCE_FILE"
+                echo "TIKTOK_TRANSCODE_CANDIDATE=1"
+              else
+                rm -f "$CANDIDATE_FILE"
+              fi
+
+              return 1
+            fi
+
+            MEDIA_FILE="$CANDIDATE_FILE"
+            return 0
+          }
+
+          download_tikwm_candidate() {
+            local api_json
+            local candidate_key
+            local candidate_url
+            local output_file
+            local curl_log
+            local transcode_source_file
+            local transcoded_file
+
+            api_json="$RUNNER_TEMP/tikwm-response.json"
+            output_file="work/tiktok_video_tikwm.mp4"
+            curl_log="$RUNNER_TEMP/tikwm-download.log"
+            transcode_source_file=""
+
+            rm -f "$api_json" "$output_file" "$curl_log"
+
+            echo "ATTEMPT=tikwm-direct"
+            update_progress 30 "Downloading" "Resolving TikTok direct video..."
+
+            if ! curl -sS -fL \
+              --connect-timeout 15 \
+              --max-time 60 \
+              --get \
+              --data-urlencode "url=${MEDIA_URL}" \
+              "https://www.tikwm.com/api/" \
+              -o "$api_json" >/dev/null 2>&1; then
+              echo "TIKWM_RESOLVE_FAILED=1"
+              return 1
+            fi
+
+            for candidate_key in hdplay play; do
+              candidate_url="$(
+                sed -nE 's/.*"'"$candidate_key"'"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' "$api_json" | head -n 1
+              )"
+
+              candidate_url="$(printf '%s' "${candidate_url:-}" | sed 's#\\/#/#g; s#\\u0026#\&#g')"
+
+              if [ -z "${candidate_url:-}" ]; then
+                continue
+              fi
+
+              if ! printf '%s' "$candidate_url" | grep -Eq '^https?://'; then
+                echo "TIKWM_DIRECT_URL_INVALID=1"
+                continue
+              fi
+
+              echo "::add-mask::${candidate_url}"
+
+              rm -f "$output_file" "$curl_log"
+
+              update_progress 40 "Downloading" "Downloading TikTok direct video..."
+
+              if ! curl -sS -fL \
+                --connect-timeout 20 \
+                --max-time 1800 \
+                --retry 2 \
+                --retry-delay 2 \
+                --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+                --referer "https://www.tiktok.com/" \
+                -o "$output_file" \
+                "$candidate_url" > "$curl_log" 2>&1; then
+                echo "TIKWM_DOWNLOAD_FAILED=1"
+                rm -f "$output_file"
+                continue
+              fi
+
+              if [ ! -f "$output_file" ]; then
+                echo "TIKWM_OUTPUT_MISSING=1"
+                continue
+              fi
+
+              if ! media_has_video_stream "$output_file"; then
+                echo "TIKWM_NO_VIDEO_STREAM=1"
+                rm -f "$output_file"
+                continue
+              fi
+
+              if ! media_has_audio_stream "$output_file"; then
+                echo "TIKWM_NO_AUDIO_STREAM=1"
+                rm -f "$output_file"
+                continue
+              fi
+
+              if media_is_telegram_video_compatible "$output_file"; then
+                MEDIA_FILE="$output_file"
+                echo "TIKWM_DOWNLOAD_SUCCESS=1"
+                return 0
+              fi
+
+              echo "TIKWM_UNSUPPORTED_CODEC=1"
+
+              if [ -z "${transcode_source_file:-}" ]; then
+                transcode_source_file="work/tiktok_transcode_source_${candidate_key}.mp4"
+                rm -f "$transcode_source_file"
+                mv "$output_file" "$transcode_source_file"
+                echo "TIKWM_TRANSCODE_CANDIDATE=1"
+              else
+                rm -f "$output_file"
+              fi
+            done
+
+            if [ -n "${transcode_source_file:-}" ] && [ -f "$transcode_source_file" ]; then
+              echo "TIKWM_TRANSCODE_FALLBACK=1"
+              update_progress 58 "Converting" "Converting clean TikTok video for Telegram..."
+
+              transcoded_file="$(transcode_to_telegram_video "$transcode_source_file" "work/tiktok_video_tikwm_transcoded.mp4" || true)"
+
+              if [ -n "${transcoded_file:-}" ] && [ -f "$transcoded_file" ]; then
+                if media_has_video_stream "$transcoded_file" && media_has_audio_stream "$transcoded_file" && media_is_telegram_video_compatible "$transcoded_file"; then
+                  MEDIA_FILE="$transcoded_file"
+                  rm -f "$transcode_source_file"
+                  echo "TIKWM_TRANSCODE_SUCCESS=1"
+                  return 0
+                fi
+
+                rm -f "$transcoded_file"
+              fi
+
+              echo "TIKWM_TRANSCODE_FAILED=1"
+              rm -f "$transcode_source_file"
+            fi
+
+            echo "TIKWM_NO_CLEAN_USABLE_CANDIDATE=1"
+            return 1
+          }
+
+          MEDIA_FILE=""
+          TRANSCODE_SOURCE_FILE=""
+
+          echo "== Download TikTok video without re-encode =="
+
+          download_tikwm_candidate || true
+
+          if [ -z "${MEDIA_FILE:-}" ] || [ ! -f "$MEDIA_FILE" ]; then
+            if ! download_tiktok_candidate "tiktok-audio-safe" "$TIKTOK_FORMAT_SELECTOR" ""; then
+              download_tiktok_candidate "tiktok-sorted-hasaud" "best[acodec!=none][vcodec!=none]/best[ext=mp4][acodec!=none][vcodec!=none]/bestvideo+bestaudio/best" "hasaud,res,fps,tbr" || true
+            fi
+          fi
+
+          if [ -z "${MEDIA_FILE:-}" ] || [ ! -f "$MEDIA_FILE" ]; then
+            download_tiktok_candidate "tiktok-best-audio-fallback" "best[acodec!=none][vcodec!=none]/best[ext=mp4][acodec!=none][vcodec!=none]/bestvideo+bestaudio/best" "" || true
+          fi
+
+          if [ -z "${MEDIA_FILE:-}" ] || [ ! -f "$MEDIA_FILE" ]; then
+            if [ -n "${TRANSCODE_SOURCE_FILE:-}" ] && [ -f "$TRANSCODE_SOURCE_FILE" ]; then
+              echo "TIKTOK_TRANSCODE_FALLBACK=1"
+              update_progress 58 "Converting" "Converting clean TikTok video for Telegram..."
+
+              TRANSCODED_FILE="$(transcode_to_telegram_video "$TRANSCODE_SOURCE_FILE" "work/tiktok_video_transcoded.mp4" || true)"
+
+              if [ -n "${TRANSCODED_FILE:-}" ] && [ -f "$TRANSCODED_FILE" ]; then
+                MEDIA_FILE="$TRANSCODED_FILE"
+              fi
+            fi
+          fi
+
+          if [ -z "${MEDIA_FILE:-}" ] || [ ! -f "$MEDIA_FILE" ]; then
+            echo "ERROR: No clean playable TikTok candidate was downloaded."
+            exit 1
+          fi
+
+          update_progress 65 "Checking" "Checking TikTok audio stream..."
+
+          if ! media_has_video_stream "$MEDIA_FILE"; then
+            echo "ERROR: Final TikTok file has no video stream."
+            exit 1
+          fi
+
+          if ! media_has_audio_stream "$MEDIA_FILE"; then
+            echo "ERROR: Final TikTok file has no audio stream."
+            exit 1
+          fi
+
+          update_progress 72 "Preparing" "Preparing TikTok video without re-encode..."
+
+          REMUXED_FILE="$(remux_to_mp4_if_needed "$MEDIA_FILE" "work/tiktok_video_ready.mp4" || true)"
+
+          if [ -z "${REMUXED_FILE:-}" ] || [ ! -f "$REMUXED_FILE" ]; then
+            echo "ERROR: TikTok remux failed."
+            exit 1
+          fi
+
+          MEDIA_FILE="$REMUXED_FILE"
+
+          if ! media_has_video_stream "$MEDIA_FILE"; then
+            echo "ERROR: Prepared TikTok file has no video stream."
+            exit 1
+          fi
+
+          if ! media_has_audio_stream "$MEDIA_FILE"; then
+            echo "ERROR: Prepared TikTok file has no audio stream."
+            exit 1
+          fi
+
+          if ! media_is_telegram_video_compatible "$MEDIA_FILE"; then
+            echo "ERROR: Prepared TikTok file is not Telegram video compatible."
+            exit 1
+          fi
+
+          SIZE_BYTES="$(stat -c%s "$MEDIA_FILE")"
+
+          echo "MEDIA_FILE_READY=1"
+
+          if [ "$SIZE_BYTES" -le 0 ]; then
+            echo "ERROR: Downloaded media file is empty."
+            exit 1
+          fi
+
+          if [ "$SIZE_BYTES" -gt 2000000000 ]; then
+            echo "ERROR: File is larger than 2000MB Local Bot API limit."
+            exit 1
+          fi
+
+          update_progress 82 "Uploading" "Uploading TikTok video to Telegram..."
+          echo "== Send TikTok video without re-encode =="
+
+          HTTP_CODE="$(curl -sS \
+            --connect-timeout 20 \
+            --max-time 7200 \
+            -o "$RUNNER_TEMP/send-video-response.json" \
+            -w "%{http_code}" \
+            -X POST "http://127.0.0.1:8081/bot${TELEGRAM_TOKEN}/sendVideo" \
+            -F "chat_id=${TELEGRAM_CHAT_ID}" \
+            -F "supports_streaming=true" \
+            -F "video=@${MEDIA_FILE}")"
+
+          echo "TELEGRAM_SEND_COMPLETED=1"
+
+          if ! echo "$HTTP_CODE" | grep -Eq '^2'; then
+            echo "ERROR: sendVideo failed."
+            exit 1
+          fi
+
+          if ! grep -q '"ok":true' "$RUNNER_TEMP/send-video-response.json"; then
+            echo "ERROR: Telegram returned non-ok response."
+            exit 1
+          fi
+
+          TELEGRAM_SENT_MESSAGE_ID="$(python3 -c 'import json,sys; print((json.load(open(sys.argv[1], encoding="utf-8")).get("result") or {}).get("message_id") or "")' "$RUNNER_TEMP/send-video-response.json" 2>/dev/null || true)"
+
+          update_completed "$TELEGRAM_SENT_MESSAGE_ID"
+          echo "OK: TikTok video was sent through sendVideo without re-encode."

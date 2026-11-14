@@ -1,0 +1,151 @@
+name: Audio Media To Telegram
+run-name: "AMD4x Audio · ${{ inputs.audio_format }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_url:
+        description: "Audio or video URL"
+        required: false
+        type: string
+      search_query:
+        description: "Optional manual audio search query"
+        required: false
+        type: string
+      audio_format:
+        description: "Final audio format"
+        required: true
+        default: "mp3"
+        type: choice
+        options:
+          - "mp3"
+          - "m4a"
+          - "raw"
+          - "voice"
+      output_filename:
+        description: "Optional final filename"
+        required: false
+        type: string
+      chat_id:
+        description: "Optional Telegram destination chat id. Falls back to TELEGRAM_CHAT_ID then ADMIN_ID."
+        required: false
+        type: string
+      progress_chat_id:
+        description: "Telegram progress chat id. Falls back to chat_id/TELEGRAM_CHAT_ID/ADMIN_ID."
+        required: false
+        type: string
+      progress_message_id:
+        description: "Telegram progress message id to edit. If empty, the workflow creates one when possible."
+        required: false
+        type: string
+      reply_to_message_id:
+        description: "Optional Telegram message id to reply to when sending the final output."
+        required: false
+        type: string
+      dispatch_key:
+        description: "Dispatch key"
+        required: false
+        default: "manual"
+        type: string
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  audio_media_send:
+    name: Extract audio and send to Telegram
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    container:
+      image: ghcr.io/amd4x/tg-video-worker:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    outputs:
+      ok: ${{ steps.audio.outputs.ok }}
+      audio_format: ${{ steps.audio.outputs.audio_format }}
+      send_mode: ${{ steps.audio.outputs.send_mode }}
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Load and verify audio media script
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p scripts/audio_media
+
+          curl -fsSL \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github.raw" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/scripts/audio_media/audio_media_worker.py?ref=${GITHUB_SHA}" \
+            -o scripts/audio_media/audio_media_worker.py
+
+          python3 -m py_compile scripts/audio_media/audio_media_worker.py
+
+      - name: Extract audio and send to Telegram
+        id: audio
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          ADMIN_ID: ${{ secrets.ADMIN_ID }}
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+          YOUTUBE_COOKIES_TXT: ${{ secrets.YOUTUBE_COOKIES_TXT }}
+          FACEBOOK_COOKIES_TXT: ${{ secrets.FACEBOOK_COOKIES_TXT }}
+        run: |
+          set -euo pipefail
+
+          # Load sensitive workflow inputs after the job starts so they do not appear in the Actions env block.
+          get_workflow_input() {
+            local input_name="$1"
+            local fallback_env="${2:-}"
+
+            if [ -n "${GITHUB_ACTIONS:-}" ] && [ -n "${GITHUB_EVENT_PATH:-}" ]; then
+              python3 -c 'import json, os, sys; data=json.load(open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8")); print(((data.get("inputs") or {}).get(sys.argv[1], "") or ""), end="")' "$input_name"
+            elif [ -n "$fallback_env" ]; then
+              printf "%s" "${!fallback_env:-}"
+            fi
+          }
+
+          mask_if_set() {
+            [ -z "${1:-}" ] && return 0
+            local value="$1"
+            value="${value//'%'/'%25'}"
+            value="${value//$'\r'/'%0D'}"
+            value="${value//$'\n'/'%0A'}"
+            echo "::add-mask::$value"
+          }
+
+          SOURCE_URL_INPUT="$(get_workflow_input source_url SOURCE_URL_INPUT)"
+          SEARCH_QUERY_INPUT="$(get_workflow_input search_query SEARCH_QUERY_INPUT)"
+          AUDIO_FORMAT_INPUT="$(get_workflow_input audio_format AUDIO_FORMAT_INPUT)"
+          OUTPUT_FILENAME_INPUT="$(get_workflow_input output_filename OUTPUT_FILENAME_INPUT)"
+          CHAT_ID_INPUT="$(get_workflow_input chat_id CHAT_ID_INPUT)"
+          PROGRESS_CHAT_ID="$(get_workflow_input progress_chat_id PROGRESS_CHAT_ID)"
+          PROGRESS_MESSAGE_ID="$(get_workflow_input progress_message_id PROGRESS_MESSAGE_ID)"
+          REPLY_TO_MESSAGE_ID="$(get_workflow_input reply_to_message_id REPLY_TO_MESSAGE_ID)"
+          DISPATCH_KEY="$(get_workflow_input dispatch_key DISPATCH_KEY)"
+
+          AUDIO_FORMAT_INPUT="${AUDIO_FORMAT_INPUT:-mp3}"
+
+          mask_if_set "$SOURCE_URL_INPUT"
+          mask_if_set "$SEARCH_QUERY_INPUT"
+          mask_if_set "$OUTPUT_FILENAME_INPUT"
+          mask_if_set "$CHAT_ID_INPUT"
+          mask_if_set "$PROGRESS_CHAT_ID"
+          mask_if_set "$PROGRESS_MESSAGE_ID"
+          mask_if_set "$REPLY_TO_MESSAGE_ID"
+          mask_if_set "$DISPATCH_KEY"
+
+          export SOURCE_URL_INPUT SEARCH_QUERY_INPUT AUDIO_FORMAT_INPUT OUTPUT_FILENAME_INPUT
+          export CHAT_ID_INPUT PROGRESS_CHAT_ID PROGRESS_MESSAGE_ID REPLY_TO_MESSAGE_ID DISPATCH_KEY
+
+          python3 scripts/audio_media/audio_media_worker.py

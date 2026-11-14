@@ -1,0 +1,228 @@
+# Telegram Media Worker
+
+GitHub Actions powered remote media worker for Telegram bots — download media, convert video to audio, compress video, inspect/repack packages, and send results using yt-dlp, FFmpeg, and Telegram Local Bot API.
+
+This repository runs temporary media jobs on GitHub-hosted runners, prepares the final media when needed, and sends the result to Telegram. It is designed for Telegram bots that need remote downloading, media conversion, document delivery, progress updates, or large-file upload behavior without keeping a permanent server online.
+
+## What it does
+
+- Downloads media or direct file URLs through GitHub Actions.
+- Sends media to Telegram as video, audio, voice, document, or ZIP output, depending on workflow support.
+- Supports progress updates by editing an existing Telegram message.
+- Uses `yt-dlp`, `ffmpeg`, `ffprobe`, `curl`, Python helpers, and Telegram Bot API / Telegram Local Bot API.
+- Supports a generic `remote-media.yml` workflow, dedicated workflows for YouTube, TikTok, Facebook, torrent document delivery, Package Inspector / Repacker, remote video compression, and audio extraction.
+- Can be started manually from GitHub Actions or programmatically from a Telegram bot through `workflow_dispatch`.
+- Masks sensitive inputs in GitHub Actions logs where possible and avoids exposing private dispatch values in run names.
+- Prepares Telegram/iPhone-compatible video output when the selected workflow includes compatibility preparation.
+- Supports large Telegram uploads through Local Bot API when configured.
+- Supports document ZIP mode and split ZIP parts in the generic workflow.
+- Supports admin-oriented torrent document delivery with file listing, selected file indexes, all-file mode, safe small-document delivery, and Telegram-safe split document parts.
+- Supports remote video compression through `video-compress.yml` with `video`, `document`, and `zip` output modes.
+- Supports audio extraction through `audio-media.yml`, including video-to-audio conversion and music-link fallback for platforms such as Spotify and SoundCloud.
+- Supports Package Inspector / Repacker flows for inspecting archives, direct files, torrents, magnets, directory listings, and URL lists, then repacking selected items into a ZIP.
+- Documents the Package Inspector / Repacker bot flow, including encrypted manifest handoff, Package Browser selection, file and folder rename actions, newest-renamed-first ordering, and final ZIP repacking.
+- Includes an optional Windows Explorer helper, AMD4x Merge, for joining downloaded split parts from the right-click menu.
+
+## Why this exists
+
+Small home servers, Raspberry Pi bots, and lightweight Telegram bot hosts are good controllers, but they are not always ideal for long media extraction, conversion, and upload tasks. This worker lets a bot delegate heavy work to an isolated GitHub Actions run, update the user with progress, and deliver the final Telegram result without keeping a permanent media server online.
+It is also useful in public-interest and censorship-resilience contexts, where users may face unreliable infrastructure, restricted access, or costly local resources. In places such as Iran, where many people struggle against severe internet restrictions, a lightweight remote worker can help users retrieve lawful public content more reliably while reducing the burden on small self-hosted bots.
+
+## Current workflow family
+
+| Workflow | Main purpose | Output type | Telegram sender | Document mode | Notes |
+|---|---|:---:|---|:---:|---|
+| `.github/workflows/remote-media.yml` | Generic remote media/file worker | Video or document | Public Bot API for small files, Local Bot API for larger files when needed | Yes | Broadest workflow. Detects several platforms and direct downloadable files. |
+| `.github/workflows/youtube-video-local-api.yml` | YouTube video sender | Video only | Local Bot API | No | YouTube-focused path with Telegram/iPhone compatibility preparation. |
+| `.github/workflows/tiktok-direct-local-api.yml` | TikTok direct video sender | Video only | Local Bot API | No | Tries direct TikTok resolver first, then `yt-dlp` fallbacks, while requiring audio and Telegram-compatible video. |
+| `.github/workflows/facebook-long-video-local-api.yml` | Facebook long-video sender | Video only | Local Bot API | No | Facebook-focused path with optional cookies and Telegram/iPhone compatibility preparation. |
+| `.github/workflows/torrent-document-local-api.yml` | Torrent document sender | Document only | Public Bot API for small documents, Local Bot API for large documents and parts | Yes | Lists torrent contents, supports selected file indexes, all-file mode, safe upload filenames, and split document delivery. |
+| `.github/workflows/package-inspect.yml` | Package source inspector | Encrypted manifest for bot; optional Telegram report | Progress message only, unless report sending is enabled | No | Builds a manifest for archives, torrents, magnets, direct files, directory listings, or URL lists. Stores the bot manifest as `.enc`. |
+| `.github/workflows/package-repack.yml` | Package item repacker | ZIP document, with split parts when needed | Public Bot API for small ZIPs, Local Bot API for larger ZIPs and parts | ZIP output only | Rebuilds a ZIP from selected manifest indexes and optional rename map. |
+| `.github/workflows/video-compress.yml` | Remote video compressor | Video, document, or ZIP | Public Bot API for small files, Local Bot API for larger files when needed | ZIP wrapper only | Compresses a source video using `compression_level` from 1 to 100, then sends the result to Telegram. |
+| `.github/workflows/audio-media.yml` | Audio extractor and converter | Audio or voice | Public Bot API for small files, Local Bot API for larger files when needed | No | Extracts audio from media URLs, converts video links to audio, and resolves music links such as Spotify through metadata fallback. |
+
+## Quick routing guide
+
+| Source URL / requested output | Recommended workflow |
+|---|---|
+| Direct downloadable file to Telegram as a document | `remote-media.yml` with `send_as=document` |
+| Any URL that should be zipped before sending | `remote-media.yml` with `send_as=document` and `document_mode=zip`; oversized ZIP output may be restored on Windows with AMD4x Merge |
+| Generic platform video | `remote-media.yml` with `send_as=video` |
+| Compress any supported video remotely | `video-compress.yml` with `compression_level` and `send_as` |
+| Extract audio from a video URL | `audio-media.yml` with `audio_format=mp3`, `m4a`, `raw`, or `voice` |
+| Music links such as Spotify or SoundCloud | `audio-media.yml`; Spotify-style links may use metadata fallback when direct audio is not available |
+| YouTube video | `youtube-video-local-api.yml` for video-only output; `remote-media.yml` for document mode |
+| TikTok video | `tiktok-direct-local-api.yml` for video-only output; `remote-media.yml` for document mode |
+| Facebook video | `facebook-long-video-local-api.yml` for video-only output; `remote-media.yml` for document mode |
+| Instagram, X/Twitter, Reddit | `remote-media.yml`; use `video-compress.yml` when compression is required |
+| Magnet links or direct `.torrent` files | `torrent-document-local-api.yml` with `file_mode=list`, then `file_mode=selected` or `file_mode=all` |
+| Archive/direct file/torrent source that should be inspected before repacking | `package-inspect.yml`, then `package-repack.yml` with selected indexes and optional rename map |
+
+
+## Security update in v1.6.0
+
+`v1.6.0` hardens GitHub Actions log handling for bot-dispatched jobs. Sensitive dispatch inputs are loaded inside the runtime step from the GitHub event payload and masked before use, instead of being passed through Actions `env:` blocks or workflow titles. This protects original media URLs, requested output filenames, progress identifiers, package rename maps, and opaque `dispatch_key` values while keeping the existing public workflow input names.
+
+This release also improves Package Inspector metadata fetching for magnet links used by Package Browser / Repacker flows.
+
+## Audio Media Worker in v1.5.0
+
+`v1.5.0` adds `audio-media.yml`, a standalone workflow for audio extraction and conversion. It can process direct audio links, supported media URLs, and video URLs that should be delivered as audio.
+
+The worker supports `mp3`, `m4a`, `raw`, and Telegram `voice` output. For platforms that do not provide a direct audio stream, such as Spotify, it can build a metadata-based search query and resolve an equivalent public audio source before sending the final result to Telegram.
+
+See [`docs/audio-media-worker.md`](docs/audio-media-worker.md) for the workflow details.
+
+## Package Inspector / Repacker in v1.4.0
+
+`v1.4.0` is centered on the Package Inspector / Repacker workflow family.
+
+The intended bot-side flow is:
+
+1. The bot receives a package-like source URL with a package inspection request.
+2. The bot starts `package-inspect.yml` and passes a unique opaque `dispatch_key` plus progress message IDs.
+3. GitHub Actions builds a stable manifest of files and folders.
+4. The manifest is encrypted into `.package_manifests/<dispatch_key>.enc` using `PACKAGE_MANIFEST_KEY`.
+5. The bot decrypts the manifest, deletes the temporary `.enc` file after a successful read, and displays Package Browser.
+6. The admin selects files, optionally renames selected files or the current folder, and may keep the newest renamed item at the top of long lists for easier review.
+7. The bot starts `package-repack.yml` with selected manifest indexes, optional `rename_map_json`, and the output ZIP name.
+8. GitHub Actions rebuilds the ZIP and sends it to Telegram, splitting the ZIP when needed.
+
+The newest-renamed-first ordering is not a separate workflow contract. It is a Package Browser usability behavior maintained by the Telegram bot. GitHub receives only the final selection and rename map.
+
+## Required secrets
+
+Create secrets in:
+
+```text
+Repository Settings -> Secrets and variables -> Actions -> Repository secrets
+```
+
+| Secret | Required by | Purpose |
+|---|---|---|
+| `TELEGRAM_TOKEN` | All workflows that send progress or final Telegram messages | Telegram bot token from BotFather. |
+| `TELEGRAM_CHAT_ID` | All final-send workflows | Destination chat, group, or channel ID. |
+| `TELEGRAM_API_ID` | Local Bot API workflows and large uploads through `remote-media.yml`, `package-repack.yml`, `video-compress.yml`, or `audio-media.yml` | Telegram API ID used by `telegram-bot-api --local`. |
+| `TELEGRAM_API_HASH` | Local Bot API workflows and large uploads through `remote-media.yml`, `package-repack.yml`, `video-compress.yml`, or `audio-media.yml` | Telegram API hash used by `telegram-bot-api --local`. |
+| `YOUTUBE_COOKIES_TXT` | Optional for YouTube paths | Netscape-format cookies for restricted, account-sensitive, age-gated, or region-gated YouTube media. |
+| `FACEBOOK_COOKIES_TXT` | Optional for Facebook paths | Netscape-format cookies for restricted or account-sensitive Facebook media. |
+| `PACKAGE_MANIFEST_KEY` | `package-inspect.yml` and bot-side manifest reader | Shared passphrase used to encrypt/decrypt package manifests stored temporarily as `.package_manifests/<dispatch_key>.enc`. |
+
+See:
+
+- [`secrets.example.md`](secrets.example.md)
+- [`docs/telegram-secrets.md`](docs/telegram-secrets.md)
+- [`docs/security-and-privacy.md`](docs/security-and-privacy.md)
+
+## Manual usage from GitHub
+
+1. Open the repository on GitHub.
+2. Go to **Actions**.
+3. Choose the workflow.
+4. Click **Run workflow**.
+5. Fill the inputs.
+6. Start the run.
+7. Watch GitHub logs or the Telegram progress message.
+
+## Common workflow inputs
+
+| Input | Used by | Meaning |
+|---|---|---|
+| `media_url` | Video and generic media workflows except `torrent-document-local-api.yml` | Source media/file URL. |
+| `source_url` | `audio-media.yml`, `package-inspect.yml`, and `package-repack.yml` | Audio/video URL for audio extraction, or package/archive source for package workflows. |
+| `torrent_url` | `torrent-document-local-api.yml` only | Magnet link or direct `.torrent` URL. |
+| `max_height` | `remote-media.yml`, YouTube, TikTok | Requested maximum video height. `remote-media.yml` exposes fixed choices. Dedicated workflows accept a string and normalize invalid values to `auto`. |
+| `send_as` | `remote-media.yml`, `video-compress.yml` | `remote-media.yml`: `video` or `document`. `video-compress.yml`: `video`, `document`, or `zip`. Dedicated platform workflows keep it only as an ignored compatibility input. |
+| `output_filename` | Document-capable paths and `video-compress.yml` | Requested output document/ZIP/video filename. `video-compress.yml` normalizes it to `.mp4` or `.zip`. Dedicated platform workflows keep it only as an ignored compatibility input. |
+| `compression_level` | `video-compress.yml` only | Compression strength from `1` to `100`; higher means stronger compression and smaller output. |
+| `audio_format` | `audio-media.yml` only | Final audio format: `mp3`, `m4a`, `raw`, or `voice`. |
+| `search_query` | `audio-media.yml` only | Optional manual audio search query when no source URL is provided. |
+| `document_mode` | `remote-media.yml` only | `zip` or `original`. Invalid values fall back to `zip`. |
+| `progress_chat_id` | Workflows with progress updates | Chat ID containing the progress message to edit. |
+| `progress_message_id` | Workflows with progress updates | Telegram message ID to edit. |
+| `dispatch_key` | Opaque caller tracking | Optional opaque task identifier used by a bot to correlate a run with local bot-side state. Do not embed chat IDs, message IDs, URLs, or filenames. |
+| `file_mode` | `torrent-document-local-api.yml` only | `list`, `selected`, or `all`. |
+| `selected_files` | `torrent-document-local-api.yml` only | Torrent file indexes such as `1`, `1,2`, or `3-5`; required when `file_mode=selected`. |
+| `split_part_mib` | `torrent-document-local-api.yml` and `package-repack.yml` | Split size in MiB for files above Telegram single-file limits. |
+| `keep_indexes` | `package-repack.yml` only | Manifest item indexes to include, such as `1`, `1,2`, or `3-5`. |
+| `delete_indexes` | `package-repack.yml` only | Manifest item indexes to exclude when `keep_indexes` is empty. |
+| `rename_map_json` | `package-repack.yml` only | JSON object mapping original manifest paths to new relative paths inside the output ZIP. |
+
+## Important capability rules
+
+- `remote-media.yml` is currently the only workflow with real `document_mode` support.
+- `video-compress.yml` has its own `send_as` modes: `video`, `document`, and `zip`; it does not use `document_mode`.
+- `audio-media.yml` is audio-only. It can convert supported video URLs into audio output, but it does not send playable Telegram video.
+- Dedicated platform workflows always send videos through `sendVideo`.
+- In dedicated platform workflows, `send_as` and `output_filename` are compatibility inputs only and are not used to change behavior.
+- Large uploads require `TELEGRAM_API_ID` and `TELEGRAM_API_HASH` because the worker must start Telegram Local Bot API.
+- Direct public Bot API uploads are used for smaller files where possible.
+- The generic workflow can create ZIP documents and split oversized ZIPs into Telegram-safe `.001`, `.002`, etc. parts. Windows users can join these parts with [`tools/windows/amd4x-merge`](tools/windows/amd4x-merge).
+- `torrent-document-local-api.yml` is document-only and uses `torrent_url` instead of `media_url`.
+- Torrent workflows should normally be used as an admin-oriented path: run `list` first, then run `selected` with explicit file indexes, or `all` when every torrent file is intended.
+- The torrent workflow sends small documents through Telegram Public Bot API when possible, uses Telegram Local Bot API for larger documents, and splits oversized files into Telegram-safe raw binary parts.
+- `package-inspect.yml` creates an encrypted manifest for bot-side Package Browser flows. The bot should decrypt and delete the `.enc` manifest after reading it.
+- `package-repack.yml` uses manifest indexes and `rename_map_json`; newest-renamed-first ordering is bot-side Package Browser state and does not change the workflow contract.
+- Split torrent parts are not ZIP/RAR archives. They are named like `filename.ext.part001`, `filename.ext.part002`, and must be joined in order to restore the original file. Windows users can use [`tools/windows/amd4x-merge`](tools/windows/amd4x-merge) instead of typing the `copy /b` command manually.
+- TikTok support may depend on a third-party direct resolver and/or `yt-dlp`; platform behavior can change without repository changes.
+
+## Workflow details
+
+Detailed behavior is documented in:
+
+- [`docs/workflows.md`](docs/workflows.md)
+- [`docs/package-inspector-repacker.md`](docs/package-inspector-repacker.md)
+- [`docs/video-compress.md`](docs/video-compress.md)
+- [`docs/audio-media-worker.md`](docs/audio-media-worker.md)
+- [`docs/architecture.md`](docs/architecture.md)
+- [`docs/supported-platforms.md`](docs/supported-platforms.md)
+- [`docs/usage-from-bot.md`](docs/usage-from-bot.md)
+- [`docs/troubleshooting.md`](docs/troubleshooting.md)
+
+## User tools
+
+Optional user-side helper tools are available in [`tools/`](tools/).
+
+Current tool:
+
+- [`AMD4x Merge`](tools/windows/amd4x-merge/) — optional Windows Explorer context-menu helper for joining downloaded split parts such as `.part001` and `.001`.
+
+These tools are optional. They do not change GitHub Actions workflows, Telegram upload behavior, repository secrets, runtime logic, or workflow inputs.
+
+## Security notes
+
+Never put bot tokens, cookies, private URLs, personal media links, chat IDs, message IDs, or raw workflow logs in public issues, screenshots, README examples, workflow files, or comments.
+
+The workflows mask sensitive inputs where possible, but masking is not a substitute for careful log handling. Treat raw workflow logs as private.
+
+Sensitive workflow inputs such as source URLs, output filenames, progress IDs, rename maps, and `dispatch_key` should not be reintroduced into Actions `env:` blocks, run names, job outputs, debug output, or public examples. The workflows load these values after the job starts and mask them before use.
+
+## Project status
+
+The repository currently contains nine workflow families:
+
+- Generic remote media/file worker.
+- YouTube Local Bot API video worker.
+- TikTok Direct Local Bot API video worker.
+- Facebook Long Video Local Bot API video worker.
+- Torrent document worker with file listing, selected indexes, all-file mode, safe small-document delivery, safe upload filenames, and split raw-part document delivery.
+- Package Inspector worker that builds encrypted manifests for bot-side browsing.
+- Package Repacker worker that rebuilds selected package items into ZIP output with optional internal renaming.
+- Video compression worker with `video`, `document`, and `zip` Telegram output modes.
+- Audio media worker with `mp3`, `m4a`, `raw`, and Telegram `voice` output modes.
+
+Known limitations:
+
+- There is no `workflow_call` interface yet.
+- Platform workflows duplicate progress and compatibility helper logic.
+- Dedicated platform workflows do not support `document_mode`.
+- Instagram, X/Twitter, and Reddit are handled by the generic workflow; they can also be processed by `video-compress.yml` when remote compression is required.
+- Music platforms that do not expose direct audio streams may rely on metadata fallback in `audio-media.yml`; the final match depends on source metadata and search result availability.
+- TikTok extraction depends on external platform behavior and may require fallback paths.
+- Torrent delivery is document-only and does not perform media conversion or Telegram/iPhone video compatibility preparation. Split torrent parts are raw binary chunks, not archives, and can be restored manually or with AMD4x Merge on Windows.
+- Package Browser ordering for renamed items is handled by the Telegram bot integration as part of the Package Inspector / Repacker flow; the workflows only receive the final selected indexes and rename map.
+
+## License
+
+MIT License. See [`LICENSE`](LICENSE).

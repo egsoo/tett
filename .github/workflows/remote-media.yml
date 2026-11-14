@@ -1,0 +1,3325 @@
+name: Remote Media To Telegram
+run-name: "AMD4x Remote · ${{ inputs.send_as }} · ${{ inputs.max_height }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      media_url:
+        description: "Media URL"
+        required: true
+        type: string
+      max_height:
+        description: "Max height"
+        required: true
+        default: "auto"
+        type: choice
+        options:
+          - "auto"
+          - "2160"
+          - "1440"
+          - "1080"
+          - "720"
+          - "480"
+          - "360"
+      send_as:
+        description: "Send as"
+        required: true
+        default: "video"
+        type: choice
+        options:
+          - "video"
+          - "document"
+      output_filename:
+        description: "Output document filename"
+        required: false
+        type: string
+      document_mode:
+        description: "Document mode"
+        required: false
+        default: "zip"
+        type: choice
+        options:
+          - "zip"
+          - "original"
+      progress_chat_id:
+        description: "Telegram progress chat id"
+        required: false
+        type: string
+      progress_message_id:
+        description: "Telegram progress message id"
+        required: false
+        type: string
+      dispatch_key:
+        description: "Dispatch key"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  download_and_send:
+    name: Download and send first success
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+     container:
+      image: ghcr.io/egsoo/tg-video-worker:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Download and send to Telegram
+        env:
+          YOUTUBE_COOKIES_TXT: ${{ secrets.YOUTUBE_COOKIES_TXT }}
+          FACEBOOK_COOKIES_TXT: ${{ secrets.FACEBOOK_COOKIES_TXT }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+        run: |
+          set -e
+
+          # Load sensitive workflow inputs after the job starts so they do not appear in the Actions env block.
+          get_workflow_input() {
+            local input_name="$1"
+            local fallback_env="${2:-}"
+
+            if [ -n "${GITHUB_ACTIONS:-}" ] && [ -n "${GITHUB_EVENT_PATH:-}" ]; then
+              python3 -c 'import json, os, sys; data=json.load(open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8")); print(((data.get("inputs") or {}).get(sys.argv[1], "") or ""), end="")' "$input_name"
+            elif [ -n "$fallback_env" ]; then
+              printf "%s" "${!fallback_env:-}"
+            fi
+          }
+
+          mask_if_set() {
+            [ -z "${1:-}" ] && return 0
+            local value="$1"
+            value="${value//'%'/'%25'}"
+            value="${value//$'\r'/'%0D'}"
+            value="${value//$'\n'/'%0A'}"
+            echo "::add-mask::$value"
+          }
+
+          mkdir -p work
+
+          SOURCE_URL="$(get_workflow_input media_url MEDIA_URL_INPUT)"
+          MAX_HEIGHT="$(get_workflow_input max_height MAX_HEIGHT_INPUT)"
+          SEND_AS="$(get_workflow_input send_as SEND_AS_INPUT)"
+          OUTPUT_FILENAME="$(get_workflow_input output_filename OUTPUT_FILENAME_INPUT)"
+          DOCUMENT_MODE="$(get_workflow_input document_mode DOCUMENT_MODE_INPUT)"
+          PROGRESS_CHAT_ID="$(get_workflow_input progress_chat_id PROGRESS_CHAT_ID)"
+          PROGRESS_MESSAGE_ID="$(get_workflow_input progress_message_id PROGRESS_MESSAGE_ID)"
+
+          MAX_HEIGHT="${MAX_HEIGHT:-auto}"
+          SEND_AS="${SEND_AS:-video}"
+          DOCUMENT_MODE="${DOCUMENT_MODE:-zip}"
+
+          mask_if_set "$SOURCE_URL"
+          mask_if_set "$OUTPUT_FILENAME"
+          mask_if_set "$PROGRESS_CHAT_ID"
+          mask_if_set "$PROGRESS_MESSAGE_ID"
+
+          if [ "$SEND_AS" != "document" ]; then
+            SEND_AS="video"
+          fi
+
+          if [ "$SEND_AS" = "document" ]; then
+            case "$DOCUMENT_MODE" in
+              original|zip)
+                ;;
+              *)
+                DOCUMENT_MODE="zip"
+                ;;
+            esac
+          else
+            DOCUMENT_MODE="zip"
+          fi
+
+          DIRECT_TELEGRAM_MAX_BYTES="50000000"
+          LOCAL_BOT_API_MAX_BYTES="2000000000"
+          DOCUMENT_SPLIT_PART_BYTES="1850000000"
+          TELEGRAM_TARGET_MAX_BYTES="1950000000"
+          MAX_FILE_BYTES="$DIRECT_TELEGRAM_MAX_BYTES"
+
+          YTDLP_MAX_FILESIZE="2000M"
+          YTDLP_MAX_FILESIZE_ARGS=()
+
+          if [ "$SEND_AS" != "document" ]; then
+            YTDLP_MAX_FILESIZE_ARGS=(--max-filesize "$YTDLP_MAX_FILESIZE")
+          fi
+
+          CONCURRENT_FRAGMENTS="4"
+          LOCAL_BOT_API_STARTED="0"
+          SIZE_FIT_APPLIED_FINAL="0"
+          SIZE_FIT_FINAL_HEIGHT_FINAL=""
+          SIZE_FIT_AUDIO_MODE_FINAL=""
+          FINAL_SIZE_STATUS="OK"
+
+          telegram_escape_html() {
+            python3 -c 'import html, sys; print(html.escape(sys.stdin.read(), quote=False), end="")'
+          }
+
+          format_bytes_for_telegram() {
+            python3 -c 'import math, sys; n=max(int(float(sys.argv[1])),0); units=["B","KB","MB","GB"]; idx=0 if n < 1024 else min(int(math.log(max(n,1), 1024)), len(units)-1); value=n/(1024**idx); print(f"{int(value)} B" if idx == 0 else f"{value:.2f} {units[idx]}")' "${1:-0}" 2>/dev/null || echo "Unknown"
+          }
+
+          telegram_send_mode_label() {
+            case "$1" in
+              public)
+                printf '%s' "Public Bot API"
+                ;;
+              local)
+                printf '%s' "Local Bot API"
+                ;;
+              *)
+                printf '%s' "${1:-Unknown}"
+                ;;
+            esac
+          }
+
+          progress_bar_text() {
+            local percent="$1"
+            local length=10
+            local filled=0
+            local empty=0
+            local bar=""
+            local i=0
+
+            if ! echo "$percent" | grep -Eq '^[0-9]+$'; then
+              percent=0
+            fi
+
+            if [ "$percent" -lt 0 ]; then
+              percent=0
+            fi
+
+            if [ "$percent" -gt 100 ]; then
+              percent=100
+            fi
+
+            filled=$((percent * length / 100))
+            empty=$((length - filled))
+
+            for i in $(seq 1 "$filled" 2>/dev/null); do
+              bar="${bar}█"
+            done
+
+            for i in $(seq 1 "$empty" 2>/dev/null); do
+              bar="${bar}░"
+            done
+
+            printf "%s" "$bar"
+          }
+
+          telegram_edit_progress() {
+            local percent="$1"
+            local label="$2"
+            local detail="$3"
+
+            if [ -z "${PROGRESS_CHAT_ID:-}" ] || [ -z "${PROGRESS_MESSAGE_ID:-}" ]; then
+              return 0
+            fi
+
+            local safe_label
+            local safe_detail
+            local safe_run_url
+            local bar
+            local text
+
+            safe_label="$(printf "%s" "$label" | telegram_escape_html)"
+            safe_detail="$(printf "%s" "$detail" | tr "_" " " | telegram_escape_html)"
+            safe_run_url="$(printf "%s" "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" | telegram_escape_html)"
+            bar="$(progress_bar_text "$percent")"
+
+            printf -v text '🐙 <b>GitHub Remote</b>\n\n📊 <code>[%s] %s%%</code>\n🧭 <b>Status:</b> %s\nℹ️ <i>%s</i>\n🆔 <code>%s</code>\n🔗 <a href="%s">Open Run</a>' \
+              "$bar" \
+              "$percent" \
+              "$safe_label" \
+              "$safe_detail" \
+              "$GITHUB_RUN_ID" \
+              "$safe_run_url"
+
+            curl -sS \
+              --connect-timeout 10 \
+              --max-time 20 \
+              -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/editMessageText" \
+              -F "chat_id=${PROGRESS_CHAT_ID}" \
+              -F "message_id=${PROGRESS_MESSAGE_ID}" \
+              -F "parse_mode=HTML" \
+              -F "disable_web_page_preview=true" \
+              -F "text=${text}" >/dev/null 2>&1 || true
+          }
+
+          progress_stage() {
+            local stage="$1"
+            local percent="$2"
+            local label="$3"
+            local detail="$4"
+
+            echo "PROGRESS_STAGE=${stage}"
+            echo "PROGRESS_PERCENT=${percent}"
+            echo "PROGRESS_LABEL=${label}"
+            echo "PROGRESS_DETAIL=${detail}"
+
+            telegram_edit_progress "$percent" "$label" "$detail"
+          }
+
+          telegram_edit_summary() {
+            local title="$1"
+            local suffix="$2"
+            local size_bytes="$3"
+            local success_height="$4"
+            local send_mode="$5"
+            local send_method="$6"
+
+            if [ -z "${PROGRESS_CHAT_ID:-}" ] || [ -z "${PROGRESS_MESSAGE_ID:-}" ]; then
+              return 0
+            fi
+
+            local downloaded_size_text
+            local final_size_text
+            local send_mode_text
+            local safe_platform
+            local safe_quality
+            local safe_input_codec
+            local safe_output_codec
+            local safe_send_mode
+            local safe_send_method
+            local safe_run_url
+            local size_fit_lines
+            local text
+
+            downloaded_size_text="$(format_bytes_for_telegram "${DOWNLOAD_SIZE_BYTES_FINAL:-0}")"
+            final_size_text="$(format_bytes_for_telegram "${size_bytes:-0}")"
+            send_mode_text="$(telegram_send_mode_label "$send_mode")"
+
+            safe_platform="$(printf "%s" "${PLATFORM:-unknown}" | telegram_escape_html)"
+            safe_quality="$(printf "%s / %s" "${success_height:-unknown}" "${MAX_HEIGHT:-auto}" | telegram_escape_html)"
+            safe_input_codec="$(printf "%s" "${INPUT_VIDEO_CODEC_FINAL:-Unknown}" | telegram_escape_html)"
+            safe_output_codec="$(printf "%s" "${OUTPUT_VIDEO_CODEC_FINAL:-Unknown}" | telegram_escape_html)"
+            safe_send_mode="$(printf "%s" "$send_mode_text" | telegram_escape_html)"
+            safe_send_method="$(printf "%s" "$send_method" | telegram_escape_html)"
+            safe_run_url="$(printf "%s" "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" | telegram_escape_html)"
+
+            size_fit_lines=""
+            if [ "${SIZE_FIT_APPLIED_FINAL:-0}" = "1" ]; then
+              printf -v size_fit_lines '\n🛠️ <b>Size Fit:</b> Applied'
+
+              if [ -n "${SIZE_FIT_FINAL_HEIGHT_FINAL:-}" ]; then
+                printf -v size_fit_lines '%s\n📉 <b>Fit Height:</b> <code>%sp</code>' "$size_fit_lines" "$SIZE_FIT_FINAL_HEIGHT_FINAL"
+              fi
+
+              if [ "${SIZE_FIT_AUDIO_MODE_FINAL:-}" = "copy" ]; then
+                printf -v size_fit_lines '%s\n🔊 <b>Audio Fit:</b> Copy — No Re-encode' "$size_fit_lines"
+              fi
+            fi
+
+            printf -v text '%s\n\n🌐 <b>Platform:</b> <code>%s</code>\n🎚️ <b>Quality:</b> <code>%s</code>\n📥 <b>Downloaded Size:</b> <code>%s</code>\n🎬 <b>Codec:</b> <code>%s → %s</code>%s\n📦 <b>Final Size:</b> <code>%s</code> — %s\n🚀 <b>Send Mode:</b> <code>%s</code>\n📤 <b>Send Method:</b> <code>%s</code>\n🆔 <code>%s</code>\n🔗 <a href="%s">Open Run</a>' \
+              "$title" \
+              "$safe_platform" \
+              "$safe_quality" \
+              "$downloaded_size_text" \
+              "$safe_input_codec" \
+              "$safe_output_codec" \
+              "$size_fit_lines" \
+              "$final_size_text" \
+              "${FINAL_SIZE_STATUS:-OK}" \
+              "$safe_send_mode" \
+              "$safe_send_method" \
+              "$GITHUB_RUN_ID" \
+              "$safe_run_url"
+
+            if [ -n "$suffix" ]; then
+              text="$(printf '%s\n%s' "$text" "$suffix")"
+            fi
+
+            curl -sS \
+              --connect-timeout 10 \
+              --max-time 20 \
+              -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/editMessageText" \
+              -F "chat_id=${PROGRESS_CHAT_ID}" \
+              -F "message_id=${PROGRESS_MESSAGE_ID}" \
+              -F "parse_mode=HTML" \
+              -F "disable_web_page_preview=true" \
+              -F "text=${text}" >/dev/null 2>&1 || true
+          }
+
+          telegram_edit_document_summary() {
+            local title="$1"
+            local suffix="$2"
+            local size_bytes="$3"
+            local send_mode="$4"
+            local send_method="$5"
+            local file_name="$6"
+
+            if [ -z "${PROGRESS_CHAT_ID:-}" ] || [ -z "${PROGRESS_MESSAGE_ID:-}" ]; then
+              return 0
+            fi
+
+            local downloaded_size_text
+            local final_size_text
+            local send_mode_text
+            local safe_platform
+            local safe_file_name
+            local safe_send_mode
+            local safe_send_method
+            local safe_run_url
+            local text
+
+            downloaded_size_text="$(format_bytes_for_telegram "${DOWNLOAD_SIZE_BYTES_FINAL:-0}")"
+            final_size_text="$(format_bytes_for_telegram "${size_bytes:-0}")"
+            send_mode_text="$(telegram_send_mode_label "$send_mode")"
+
+            safe_platform="$(printf "%s" "${PLATFORM:-direct}" | telegram_escape_html)"
+            safe_file_name="$(printf "%s" "${file_name:-document}" | telegram_escape_html)"
+            safe_send_mode="$(printf "%s" "$send_mode_text" | telegram_escape_html)"
+            safe_send_method="$(printf "%s" "$send_method" | telegram_escape_html)"
+            safe_run_url="$(printf "%s" "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" | telegram_escape_html)"
+
+            printf -v text '%s
+
+            🌐 <b>Source:</b> <code>%s</code>
+            📄 <b>File:</b> <code>%s</code>
+            📥 <b>Downloaded Size:</b> <code>%s</code>
+            📦 <b>Final Size:</b> <code>%s</code> — %s
+            🚀 <b>Send Mode:</b> <code>%s</code>
+            📤 <b>Send Method:</b> <code>%s</code>
+            🆔 <code>%s</code>
+            🔗 <a href="%s">Open Run</a>' \
+              "$title" \
+              "$safe_platform" \
+              "$safe_file_name" \
+              "$downloaded_size_text" \
+              "$final_size_text" \
+              "${FINAL_SIZE_STATUS:-OK}" \
+              "$safe_send_mode" \
+              "$safe_send_method" \
+              "$GITHUB_RUN_ID" \
+              "$safe_run_url"
+
+            if [ -n "$suffix" ]; then
+              text="$(printf '%s\n%s' "$text" "$suffix")"
+            fi
+
+            curl -sS \
+              --connect-timeout 10 \
+              --max-time 20 \
+              -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/editMessageText" \
+              -F "chat_id=${PROGRESS_CHAT_ID}" \
+              -F "message_id=${PROGRESS_MESSAGE_ID}" \
+              -F "parse_mode=HTML" \
+              -F "disable_web_page_preview=true" \
+              -F "text=${text}" >/dev/null 2>&1 || true
+          }
+
+          progress_stage "preparing" "10" "Preparing" "Preparing_worker"
+
+          if [ "$MAX_HEIGHT" = "auto" ]; then
+            AUTO_MODE="1"
+            MAX_HEIGHT_NUM="2160"
+          else
+            AUTO_MODE="0"
+            MAX_HEIGHT_NUM="$MAX_HEIGHT"
+          fi
+
+          echo "yt-dlp version:"
+          python3 -m yt_dlp --version
+
+          echo "Deno version:"
+          deno --version || true
+
+          echo "ffmpeg version:"
+          ffmpeg -version | head -n 1
+
+          if [ -z "$SOURCE_URL" ]; then
+            echo "ERROR: Missing media_url."
+            exit 1
+          fi
+
+          if [ -z "${TELEGRAM_TOKEN:-}" ]; then
+            echo "ERROR: Missing TELEGRAM_TOKEN secret."
+            exit 1
+          fi
+
+          if [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
+            echo "ERROR: Missing TELEGRAM_CHAT_ID secret."
+            exit 1
+          fi
+
+          echo "::add-mask::${TELEGRAM_TOKEN}"
+          echo "::add-mask::${TELEGRAM_CHAT_ID}"
+
+          if [ -n "${PROGRESS_CHAT_ID:-}" ]; then
+            echo "::add-mask::${PROGRESS_CHAT_ID}"
+          fi
+
+          if [ -n "${PROGRESS_MESSAGE_ID:-}" ]; then
+            echo "::add-mask::${PROGRESS_MESSAGE_ID}"
+          fi
+
+          if [ -n "${TELEGRAM_API_ID:-}" ]; then
+            echo "::add-mask::${TELEGRAM_API_ID}"
+          fi
+
+          if [ -n "${TELEGRAM_API_HASH:-}" ]; then
+            echo "::add-mask::${TELEGRAM_API_HASH}"
+          fi
+
+          progress_stage "validating" "15" "Validating" "Validating_inputs_and_secrets"
+          progress_stage "detecting_platform" "20" "Detecting" "Detecting_media_platform"
+
+          WORK_URL="$SOURCE_URL"
+          VIDEO_ID=""
+          PLATFORM="generic"
+          IS_YOUTUBE="0"
+          IS_FACEBOOK="0"
+          REFERER_URL="https://www.google.com/"
+
+          LOWER_URL="$(printf "%s" "$SOURCE_URL" | tr "[:upper:]" "[:lower:]")"
+
+          if echo "$LOWER_URL" | grep -Eq "(youtube\.com|youtu\.be)"; then
+            PLATFORM="youtube"
+            IS_YOUTUBE="1"
+            REFERER_URL="https://www.youtube.com/"
+
+            if echo "$SOURCE_URL" | grep -Eq "youtube\.com/shorts/[A-Za-z0-9_-]+"; then
+              VIDEO_ID="$(echo "$SOURCE_URL" | sed -nE 's#.*youtube\.com/shorts/([A-Za-z0-9_-]+).*#\1#p')"
+            elif echo "$SOURCE_URL" | grep -Eq "youtu\.be/[A-Za-z0-9_-]+"; then
+              VIDEO_ID="$(echo "$SOURCE_URL" | sed -nE 's#.*youtu\.be/([A-Za-z0-9_-]+).*#\1#p')"
+            elif echo "$SOURCE_URL" | grep -Eq "[?&]v=[A-Za-z0-9_-]+"; then
+              VIDEO_ID="$(echo "$SOURCE_URL" | sed -nE 's#.*[?&]v=([A-Za-z0-9_-]+).*#\1#p')"
+            fi
+
+            if [ -n "$VIDEO_ID" ]; then
+              WORK_URL="https://www.youtube.com/watch?v=${VIDEO_ID}"
+            fi
+          elif echo "$LOWER_URL" | grep -Eq "(facebook\.com|fb\.watch)"; then
+            PLATFORM="facebook"
+            IS_FACEBOOK="1"
+            REFERER_URL="https://www.facebook.com/"
+          elif echo "$LOWER_URL" | grep -Eq "(instagram\.com)"; then
+            PLATFORM="instagram"
+            REFERER_URL="https://www.instagram.com/"
+          elif echo "$LOWER_URL" | grep -Eq "(tiktok\.com|vm\.tiktok\.com|vt\.tiktok\.com)"; then
+            PLATFORM="tiktok"
+            REFERER_URL="https://www.tiktok.com/"
+          elif echo "$LOWER_URL" | grep -Eq "(twitter\.com|x\.com)"; then
+            PLATFORM="x"
+            REFERER_URL="https://x.com/"
+          elif echo "$LOWER_URL" | grep -Eq "(reddit\.com|redd\.it)"; then
+            PLATFORM="reddit"
+            REFERER_URL="https://www.reddit.com/"
+          fi
+
+          echo "::add-mask::${WORK_URL}"
+
+          if [ -n "$VIDEO_ID" ]; then
+            echo "::add-mask::${VIDEO_ID}"
+          fi
+
+          echo "PLATFORM=${PLATFORM}"
+          echo "ORIGINAL_URL=masked"
+          echo "NORMALIZED_URL=masked"
+          echo "MAX_HEIGHT=masked"
+          echo "MAX_HEIGHT_NUM=masked"
+          echo "SEND_AS=${SEND_AS}"
+          echo "AUTO_MODE=${AUTO_MODE}"
+          echo "REFERER_PLATFORM=${PLATFORM}"
+
+          progress_stage "preparing_cookies" "24" "Preparing" "Preparing_site_cookies"
+
+          COOKIES_ARGS=()
+
+          if [ "$IS_YOUTUBE" = "1" ] && [ -n "${YOUTUBE_COOKIES_TXT:-}" ]; then
+            COOKIES_FILE="$RUNNER_TEMP/youtube-cookies.txt"
+            umask 077
+            printf '%s\n' "$YOUTUBE_COOKIES_TXT" > "$COOKIES_FILE"
+            sed -i 's/\r$//' "$COOKIES_FILE"
+
+            COOKIE_HAS_NETSCAPE="$(grep -E '^# Netscape HTTP Cookie File' "$COOKIES_FILE" >/dev/null 2>&1 && echo yes || echo no)"
+
+            COOKIES_ARGS=(--cookies "$COOKIES_FILE")
+
+            echo "YOUTUBE_COOKIES=enabled"
+            echo "COOKIE_HAS_NETSCAPE_HEADER=${COOKIE_HAS_NETSCAPE}"
+          elif [ "$IS_FACEBOOK" = "1" ] && [ -n "${FACEBOOK_COOKIES_TXT:-}" ]; then
+            COOKIES_FILE="$RUNNER_TEMP/facebook-cookies.txt"
+            umask 077
+            printf '%s\n' "$FACEBOOK_COOKIES_TXT" > "$COOKIES_FILE"
+            sed -i 's/\r$//' "$COOKIES_FILE"
+
+            COOKIE_HAS_NETSCAPE="$(grep -E '^# Netscape HTTP Cookie File' "$COOKIES_FILE" >/dev/null 2>&1 && echo yes || echo no)"
+
+            COOKIES_ARGS=(--cookies "$COOKIES_FILE")
+
+            echo "FACEBOOK_COOKIES=enabled"
+            echo "COOKIE_HAS_NETSCAPE_HEADER=${COOKIE_HAS_NETSCAPE}"
+          else
+            if [ "$IS_YOUTUBE" = "1" ]; then
+              echo "YOUTUBE_COOKIES=disabled"
+            elif [ "$IS_FACEBOOK" = "1" ]; then
+              echo "FACEBOOK_COOKIES=disabled"
+            else
+              echo "SITE_COOKIES=disabled"
+            fi
+          fi
+
+          HEIGHTS=""
+
+          if [ "$MAX_HEIGHT_NUM" -ge 2160 ] 2>/dev/null; then
+            HEIGHTS="$HEIGHTS 2160"
+          fi
+
+          if [ "$MAX_HEIGHT_NUM" -ge 1440 ] 2>/dev/null; then
+            HEIGHTS="$HEIGHTS 1440"
+          fi
+
+          if [ "$MAX_HEIGHT_NUM" -ge 1080 ] 2>/dev/null; then
+            HEIGHTS="$HEIGHTS 1080"
+          fi
+
+          if [ "$MAX_HEIGHT_NUM" -ge 720 ] 2>/dev/null; then
+            HEIGHTS="$HEIGHTS 720"
+          fi
+
+          if [ "$MAX_HEIGHT_NUM" -ge 480 ] 2>/dev/null; then
+            HEIGHTS="$HEIGHTS 480"
+          fi
+
+          HEIGHTS="$HEIGHTS 360"
+
+          echo "HEIGHTS=masked"
+
+          progress_stage "selecting_formats" "28" "Selecting" "Selecting_download_formats"
+
+          print_log_safely() {
+            local log_file="$1"
+
+            sed -E \
+              -e 's#https?://[^[:space:]]+#<masked-url>#g' \
+              -e 's#(\[generic\] )[A-Za-z0-9_-]{6,}(: Downloading webpage)#\1<masked-id>\2#g' \
+              -e 's#(\[[A-Za-z0-9:_-]+\] )[0-9]{6,}(:)#\1<masked-id>\2#g' \
+              -e 's#([?&]v=)[A-Za-z0-9_-]+#\1<masked-id>#g' \
+              -e 's#(/reel/)[0-9]+#<masked-id>#g' \
+              -e 's#[0-9]+([.][0-9]+)?[[:space:]]*(KiB|MiB|GiB|TiB|KB|MB|GB|TB|B)(/s)?#<masked-size>#g' \
+              -e 's#[0-9]{10,}#<masked-id>#g' \
+              "$log_file"
+          }
+
+          safe_document_file_name_from_url() {
+            python3 - "$1" <<'PY'
+          import re
+          import sys
+          import urllib.parse
+
+          url = sys.argv[1]
+          path = urllib.parse.urlparse(url).path
+          name = urllib.parse.unquote(path.rsplit('/', 1)[-1]).strip()
+          name = re.sub(r'[\\/*?:"<>|]', '', name).strip()
+
+          if not name or '.' not in name:
+              name = 'telegram_document.bin'
+
+          print(name[:120])
+          PY
+          }
+
+          sanitize_document_file_name() {
+            python3 - "$1" "$2" <<'PY'
+          import os
+          import re
+          import sys
+          import urllib.parse
+
+          requested = urllib.parse.unquote((sys.argv[1] or '').strip())
+          fallback = urllib.parse.unquote((sys.argv[2] or '').strip())
+
+          def clean(value):
+              value = value.replace('\\', '/')
+              value = os.path.basename(value)
+              value = re.sub(r'[\x00-\x1f\x7f]', '', value)
+              value = re.sub(r'[\/*?:"<>|]', '', value)
+              value = re.sub(r'\s+', ' ', value).strip().strip('.')
+              return value
+
+          fallback = clean(fallback) or 'telegram_document.bin'
+          name = clean(requested) or fallback
+
+          base, ext = os.path.splitext(name)
+          fallback_base, fallback_ext = os.path.splitext(fallback)
+
+          if not ext:
+              ext = fallback_ext or '.bin'
+              name = f"{base or fallback_base or 'telegram_document'}{ext}"
+
+          base, ext = os.path.splitext(name)
+          if len(name) > 120:
+              base = base[:max(1, 120 - len(ext))].rstrip().strip('.')
+              name = f"{base or 'telegram_document'}{ext}"
+
+          print(name or 'telegram_document.bin')
+          PY
+          }
+
+          sanitize_zip_file_name() {
+            python3 - "$1" "$2" <<'PY'
+          import os
+          import re
+          import sys
+          import urllib.parse
+
+          requested = urllib.parse.unquote((sys.argv[1] or '').strip())
+          fallback = urllib.parse.unquote((sys.argv[2] or '').strip())
+
+          def clean(value):
+              value = value.replace('\\', '/')
+              value = os.path.basename(value)
+              value = re.sub(r'[\x00-\x1f\x7f]', '', value)
+              value = re.sub(r'[\/*?:"<>|]', '', value)
+              value = re.sub(r'\s+', ' ', value).strip().strip('.')
+              return value
+
+          fallback = clean(fallback) or 'telegram_document.zip'
+          name = clean(requested) or fallback
+
+          base, ext = os.path.splitext(name)
+          fallback_base, _fallback_ext = os.path.splitext(fallback)
+
+          if ext.lower() == '.zip':
+              zip_name = name
+          else:
+              zip_name = f"{base or name or fallback_base or 'telegram_document'}.zip"
+
+          base, ext = os.path.splitext(zip_name)
+          if len(zip_name) > 120:
+              base = base[:max(1, 120 - len(ext))].rstrip().strip('.')
+              zip_name = f"{base or 'telegram_document'}{ext}"
+
+          print(zip_name or 'telegram_document.zip')
+          PY
+          }
+
+          zip_inner_file_name() {
+            python3 - "$1" "$2" <<'PY'
+          import os
+          import re
+          import sys
+
+          zip_name = sys.argv[1] or 'telegram_document.zip'
+          source_name = sys.argv[2] or 'telegram_document.bin'
+
+          base, _zip_ext = os.path.splitext(os.path.basename(zip_name))
+          _source_base, source_ext = os.path.splitext(os.path.basename(source_name))
+
+          if not source_ext or source_ext.lower() == '.zip':
+              source_ext = '.bin'
+
+          base = re.sub(r'[\x00-\x1f\x7f]', '', base)
+          base = re.sub(r'[\/*?:"<>|]', '', base)
+          base = re.sub(r'\s+', ' ', base).strip().strip('.') or 'telegram_document'
+
+          print(f"{base}{source_ext}"[:120])
+          PY
+          }
+
+          zip_document_for_telegram() {
+            set +e
+
+            local source_path="$1"
+            local requested_name="$2"
+            local fallback_name="$3"
+
+            if [ ! -f "$source_path" ]; then
+              echo "ERROR: ZIP source file is missing."
+              return 1
+            fi
+
+            local source_size
+            source_size="$(stat -c%s "$source_path" 2>/dev/null || echo 0)"
+
+            if [ "$source_size" -le 0 ]; then
+              echo "ERROR: ZIP source file is empty."
+              return 1
+            fi
+
+
+            local zip_name
+            local zip_path
+            local inner_name
+            local zip_size
+
+            zip_name="$(sanitize_zip_file_name "$requested_name" "$fallback_name")"
+            zip_path="work/${zip_name}"
+            inner_name="$(zip_inner_file_name "$zip_name" "$(basename "$source_path")")"
+
+            rm -f "$zip_path"
+
+            progress_stage "zipping_document" "68" "Packing" "Packing_document_zip"
+
+            python3 - "$source_path" "$zip_path" "$inner_name" <<'PY'
+          import sys
+          import zipfile
+
+          source_path, zip_path, inner_name = sys.argv[1:4]
+
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
+              zf.write(source_path, arcname=inner_name)
+          PY
+
+            if [ ! -f "$zip_path" ]; then
+              echo "ERROR: ZIP output file is missing."
+              return 1
+            fi
+
+            zip_size="$(stat -c%s "$zip_path" 2>/dev/null || echo 0)"
+
+            if [ "$zip_size" -le 0 ]; then
+              echo "ERROR: ZIP output file is empty."
+              rm -f "$zip_path"
+              return 1
+            fi
+
+            echo "::add-mask::${zip_name}"
+            echo "::add-mask::${zip_path}"
+            echo "::add-mask::${inner_name}"
+            echo "DOCUMENT_ZIP_CREATED=1"
+            echo "DOCUMENT_ZIP_FILE=masked"
+            echo "DOCUMENT_ZIP_INNER_NAME=masked"
+            echo "::add-mask::${zip_size}"
+            echo "DOCUMENT_ZIP_SIZE_BYTES=masked"
+
+            DOCUMENT_ZIP_FILE="$zip_path"
+            DOCUMENT_ZIP_INNER_NAME="$inner_name"
+            return 0
+          }
+
+          document_file_name_from_headers() {
+            python3 - "$1" <<'PY'
+          import os
+          import re
+          import sys
+          import urllib.parse
+
+          def repair_mojibake_filename(name):
+              try:
+                  repaired = name.encode("latin-1").decode("utf-8")
+              except (UnicodeEncodeError, UnicodeDecodeError):
+                  return name
+
+              old_arabic = sum("\u0600" <= char <= "\u06ff" for char in name)
+              new_arabic = sum("\u0600" <= char <= "\u06ff" for char in repaired)
+              return repaired if new_arabic > old_arabic else name
+
+          header_path = sys.argv[1]
+          value = ""
+
+          try:
+              with open(header_path, "r", encoding="utf-8", errors="ignore") as f:
+                  lines = f.readlines()
+          except Exception:
+              lines = []
+
+          content_disposition = ""
+          for line in lines:
+              if line.lower().startswith("content-disposition:"):
+                  content_disposition = line.split(":", 1)[1].strip()
+
+          if content_disposition:
+              match = re.search(r"filename\*\s*=\s*[^']*''([^;]+)", content_disposition, re.I)
+              if match:
+                  value = urllib.parse.unquote(match.group(1).strip().strip('"'))
+              else:
+                  match = re.search(r'filename\s*=\s*"([^"]+)"', content_disposition, re.I)
+                  if match:
+                      value = match.group(1).strip()
+                  else:
+                      match = re.search(r"filename\s*=\s*([^;]+)", content_disposition, re.I)
+                      if match:
+                          value = match.group(1).strip().strip('"')
+
+          value = urllib.parse.unquote(value or "")
+          value = repair_mojibake_filename(value).replace("\\", "/")
+          value = os.path.basename(value)
+          value = re.sub(r'[\x00-\x1f\x7f]', '', value)
+          value = re.sub(r'[\\/*?:"<>|]', '', value)
+          value = re.sub(r'\s+', ' ', value).strip().strip(".")
+
+          print(value[:120])
+          PY
+          }
+
+          downloaded_document_looks_like_html() {
+            python3 - "$1" "$2" <<'PY'
+          import sys
+
+          file_path = sys.argv[1]
+          header_path = sys.argv[2]
+
+          content_type = ""
+          try:
+              with open(header_path, "r", encoding="utf-8", errors="ignore") as f:
+                  for line in f:
+                      if line.lower().startswith("content-type:"):
+                          content_type = line.split(":", 1)[1].strip().lower()
+          except Exception:
+              pass
+
+          if "text/html" in content_type or "application/xhtml" in content_type:
+              print("yes")
+              raise SystemExit(0)
+
+          try:
+              with open(file_path, "rb") as f:
+                  data = f.read(8192)
+          except Exception:
+              print("yes")
+              raise SystemExit(0)
+
+          sample = data.lstrip(b"\xef\xbb\xbf\r\n\t ")
+          low = sample[:1024].lower()
+
+          html_markers = (
+              b"<!doctype html",
+              b"<html",
+              b"<head",
+              b"<body",
+              b"<title",
+          )
+
+          if any(marker in low[:512] for marker in html_markers):
+              print("yes")
+          else:
+              print("no")
+          PY
+          }
+
+          try_intermediate_document_download() {
+            set +e
+
+            local output_file="$1"
+            local header_file="$2"
+            local resolver_rc
+
+            rm -f "$output_file" "$header_file"
+
+            python3 - "$SOURCE_URL" "$REFERER_URL" "$output_file" "$header_file" >/dev/null 2>&1 <<'PY'
+          import collections
+          import http.cookiejar
+          import ipaddress
+          import os
+          import re
+          import socket
+          import sys
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          from html.parser import HTMLParser
+
+          source_url, initial_referer, output_file, header_file = sys.argv[1:5]
+
+          USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+          MAX_HTML_BYTES = 2 * 1024 * 1024
+          MAX_REQUESTS = 8
+          MAX_DEPTH = 3
+          STREAM_CHUNK = 1024 * 1024
+
+          POSITIVE_TERMS = {
+              "download": 12,
+              "direct": 8,
+              "attachment": 8,
+              "confirm": 7,
+              "export": 6,
+              "save": 5,
+              "fetch": 4,
+              "file": 3,
+              "document": 2,
+              "get": 1,
+              "start": 1,
+              "continue": 1,
+          }
+          NEGATIVE_TERMS = (
+              "login",
+              "log-in",
+              "signin",
+              "sign-in",
+              "logout",
+              "signout",
+              "register",
+              "signup",
+              "password",
+              "account",
+              "delete",
+              "remove",
+              "unsubscribe",
+              "upload",
+          )
+          FILE_EXTENSIONS = (
+              ".zip", ".7z", ".rar", ".tar", ".gz", ".bz2", ".xz",
+              ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".csv", ".txt",
+              ".mp3", ".m4a", ".wav", ".flac", ".mp4", ".mkv", ".mov",
+              ".avi", ".webm", ".jpg", ".jpeg", ".png", ".webp", ".bin",
+          )
+
+          def cleanup_partial():
+              for path in (output_file, output_file + ".part", header_file):
+                  try:
+                      os.remove(path)
+                  except FileNotFoundError:
+                      pass
+                  except OSError:
+                      pass
+
+          def is_public_http_url(url):
+              try:
+                  parsed = urllib.parse.urlsplit(url)
+              except Exception:
+                  return False
+
+              if parsed.scheme.lower() not in ("http", "https") or not parsed.hostname:
+                  return False
+
+              host = parsed.hostname.rstrip(".").lower()
+              if host in {"localhost", "localhost.localdomain"} or host.endswith((".local", ".internal", ".localhost")):
+                  return False
+
+              try:
+                  addresses = {item[4][0] for item in socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme.lower() == "https" else 80), type=socket.SOCK_STREAM)}
+              except Exception:
+                  return False
+
+              if not addresses:
+                  return False
+
+              for address in addresses:
+                  try:
+                      ip = ipaddress.ip_address(address.split("%", 1)[0])
+                  except ValueError:
+                      return False
+
+                  if not ip.is_global:
+                      return False
+
+              return True
+
+          def header_filename(final_url):
+              try:
+                  path = urllib.parse.urlsplit(final_url).path
+                  value = urllib.parse.unquote(path.rsplit("/", 1)[-1]).strip()
+              except Exception:
+                  return ""
+
+              value = re.sub(r"[\x00-\x1f\x7f]", "", value)
+              value = re.sub(r"[\\/*?:\"<>|]", "", value)
+              value = re.sub(r"\s+", " ", value).strip().strip(".")
+              if not value or "." not in value:
+                  return ""
+              return value[:120]
+
+          def write_headers(response):
+              status = getattr(response, "status", 200)
+              reason = getattr(response, "reason", "OK")
+              lines = [f"HTTP/1.1 {status} {reason}\n"]
+              has_disposition = False
+
+              for key, value in response.headers.items():
+                  if key.lower() == "content-disposition":
+                      has_disposition = True
+                  clean_value = str(value).replace("\r", " ").replace("\n", " ")
+                  lines.append(f"{key}: {clean_value}\n")
+
+              if not has_disposition:
+                  fallback_name = header_filename(response.geturl())
+                  if fallback_name:
+                      lines.append(f'Content-Disposition: attachment; filename="{fallback_name}"\n')
+
+              lines.append("\n")
+              with open(header_file, "w", encoding="utf-8", errors="ignore") as out:
+                  out.writelines(lines)
+
+          def looks_like_html(content_type, sample):
+              low_type = (content_type or "").lower()
+              if "text/html" in low_type or "application/xhtml" in low_type:
+                  return True
+
+              stripped = sample.lstrip(b"\xef\xbb\xbf\r\n\t ")
+              low = stripped[:1024].lower()
+              markers = (b"<!doctype html", b"<html", b"<head", b"<body", b"<title")
+              return any(marker in low[:512] for marker in markers)
+
+          def consume_response(response):
+              first = response.read(8192)
+              content_type = response.headers.get("Content-Type", "")
+
+              if looks_like_html(content_type, first):
+                  remaining = max(0, MAX_HTML_BYTES - len(first))
+                  body = first + (response.read(remaining) if remaining else b"")
+                  charset = response.headers.get_content_charset() or "utf-8"
+                  try:
+                      html_text = body.decode(charset, errors="replace")
+                  except LookupError:
+                      html_text = body.decode("utf-8", errors="replace")
+                  return "html", html_text
+
+              temp_output = output_file + ".part"
+              with open(temp_output, "wb") as out:
+                  if first:
+                      out.write(first)
+                  while True:
+                      chunk = response.read(STREAM_CHUNK)
+                      if not chunk:
+                          break
+                      out.write(chunk)
+
+              if os.path.getsize(temp_output) <= 0:
+                  raise ValueError("empty response")
+
+              write_headers(response)
+              os.replace(temp_output, output_file)
+              return "file", ""
+
+          class DownloadPageParser(HTMLParser):
+              def __init__(self):
+                  super().__init__(convert_charrefs=True)
+                  self.base_href = ""
+                  self.links = []
+                  self.forms = []
+                  self.meta_refresh = []
+                  self.current_anchor = None
+                  self.current_form = None
+                  self.current_button = None
+
+              @staticmethod
+              def attrs_dict(attrs):
+                  return {str(key).lower(): (value or "") for key, value in attrs}
+
+              def handle_starttag(self, tag, attrs):
+                  tag = tag.lower()
+                  values = self.attrs_dict(attrs)
+
+                  if tag == "base" and values.get("href") and not self.base_href:
+                      self.base_href = values["href"]
+                  elif tag == "a" and values.get("href"):
+                      self.current_anchor = {"href": values["href"], "text": []}
+                  elif tag == "meta" and values.get("http-equiv", "").lower() == "refresh":
+                      content = values.get("content", "")
+                      match = re.search(r"(?:^|;)\s*url\s*=\s*['\"]?([^'\";]+)", content, re.I)
+                      if match:
+                          self.meta_refresh.append(match.group(1).strip())
+                  elif tag == "form":
+                      self.current_form = {
+                          "action": values.get("action", ""),
+                          "method": values.get("method", "get").lower(),
+                          "fields": [],
+                          "labels": [],
+                          "unsafe": False,
+                      }
+                  elif tag == "input" and self.current_form is not None:
+                      input_type = values.get("type", "text").lower()
+                      name = values.get("name", "")
+                      value = values.get("value", "")
+
+                      if input_type in ("password", "file"):
+                          self.current_form["unsafe"] = True
+                      elif name and input_type not in ("button", "reset"):
+                          if input_type in ("checkbox", "radio") and "checked" not in values:
+                              return
+                          self.current_form["fields"].append((name, value))
+                          if input_type in ("submit", "image"):
+                              self.current_form["labels"].append(value)
+                  elif tag == "button" and self.current_form is not None:
+                      self.current_button = {
+                          "name": values.get("name", ""),
+                          "value": values.get("value", ""),
+                          "type": values.get("type", "submit").lower(),
+                          "text": [],
+                      }
+
+              def handle_data(self, data):
+                  if self.current_anchor is not None:
+                      self.current_anchor["text"].append(data)
+                  if self.current_button is not None:
+                      self.current_button["text"].append(data)
+
+              def handle_endtag(self, tag):
+                  tag = tag.lower()
+                  if tag == "a" and self.current_anchor is not None:
+                      self.current_anchor["text"] = " ".join(self.current_anchor["text"]).strip()
+                      self.links.append(self.current_anchor)
+                      self.current_anchor = None
+                  elif tag == "button" and self.current_button is not None and self.current_form is not None:
+                      label = " ".join(self.current_button["text"]).strip() or self.current_button["value"]
+                      if label:
+                          self.current_form["labels"].append(label)
+                      if self.current_button["type"] == "submit" and self.current_button["name"]:
+                          self.current_form["fields"].append((self.current_button["name"], self.current_button["value"] or label))
+                      self.current_button = None
+                  elif tag == "form" and self.current_form is not None:
+                      self.forms.append(self.current_form)
+                      self.current_form = None
+                      self.current_button = None
+
+          def score_text(value):
+              low = urllib.parse.unquote_plus(value or "").lower()
+              if any(term in low for term in NEGATIVE_TERMS):
+                  return -100
+
+              score = 0
+              for term, weight in POSITIVE_TERMS.items():
+                  if term in low:
+                      score += weight
+
+              path = urllib.parse.urlsplit(value or "").path.lower()
+              if path.endswith(FILE_EXTENSIONS):
+                  score += 10
+              return score
+
+          def build_candidates(html_text, page_url, depth):
+              parser = DownloadPageParser()
+              try:
+                  parser.feed(html_text)
+              except Exception:
+                  pass
+
+              base_url = urllib.parse.urljoin(page_url, parser.base_href or page_url)
+              ranked = []
+
+              for target in parser.meta_refresh:
+                  url = urllib.parse.urljoin(base_url, target)
+                  ranked.append((30, "GET", url, None, page_url, depth + 1))
+
+              js_patterns = (
+                  r"(?:window\s*\.\s*)?location(?:\s*\.\s*href)?\s*=\s*['\"]([^'\"]+)['\"]",
+                  r"window\s*\.\s*open\s*\(\s*['\"]([^'\"]+)['\"]",
+              )
+              for pattern in js_patterns:
+                  for match in re.finditer(pattern, html_text, re.I):
+                      url = urllib.parse.urljoin(base_url, match.group(1).strip())
+                      ranked.append((25, "GET", url, None, page_url, depth + 1))
+
+              for link in parser.links:
+                  url = urllib.parse.urljoin(base_url, link["href"])
+                  score = score_text(link["href"] + " " + link.get("text", ""))
+                  if score >= 3:
+                      ranked.append((score, "GET", url, None, page_url, depth + 1))
+
+              for form in parser.forms:
+                  if form["unsafe"] or form["method"] not in ("get", "post"):
+                      continue
+
+                  action = urllib.parse.urljoin(base_url, form["action"] or page_url)
+                  corpus = " ".join([
+                      form["action"],
+                      " ".join(name for name, _value in form["fields"]),
+                      " ".join(value for _name, value in form["fields"]),
+                      " ".join(form["labels"]),
+                  ])
+                  score = score_text(corpus)
+                  if form["method"] == "post":
+                      score += 2
+                  if score < 3:
+                      continue
+
+                  encoded = urllib.parse.urlencode(form["fields"], doseq=True)
+                  if form["method"] == "get":
+                      parts = urllib.parse.urlsplit(action)
+                      query = "&".join(item for item in (parts.query, encoded) if item)
+                      target = urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, query, parts.fragment))
+                      ranked.append((score, "GET", target, None, page_url, depth + 1))
+                  else:
+                      ranked.append((score, "POST", action, encoded.encode("utf-8"), page_url, depth + 1))
+
+              ranked.sort(key=lambda item: item[0], reverse=True)
+              result = []
+              seen = set()
+              for _score, method, url, data, referer, candidate_depth in ranked:
+                  key = (method, url, data or b"")
+                  if key in seen:
+                      continue
+                  seen.add(key)
+                  result.append((method, url, data, referer, candidate_depth))
+                  if len(result) >= 6:
+                      break
+              return result
+
+          def request_headers(referer, method):
+              headers = {
+                  "User-Agent": USER_AGENT,
+                  "Accept-Language": "en-US,en;q=0.9",
+                  "Accept": "application/octet-stream,text/html,application/xhtml+xml,*/*;q=0.8",
+              }
+              if referer:
+                  headers["Referer"] = referer
+              if method == "POST":
+                  headers["Content-Type"] = "application/x-www-form-urlencoded"
+              return headers
+
+          def main():
+              cleanup_partial()
+              if not is_public_http_url(source_url):
+                  return 1
+
+              cookie_jar = http.cookiejar.CookieJar()
+              opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cookie_jar))
+              queue = collections.deque([("GET", source_url, None, initial_referer, 0)])
+              visited = set()
+              request_count = 0
+
+              while queue and request_count < MAX_REQUESTS:
+                  method, url, data, referer, depth = queue.popleft()
+                  if depth > MAX_DEPTH or not is_public_http_url(url):
+                      continue
+
+                  visit_key = (method, url, data or b"")
+                  if visit_key in visited:
+                      continue
+                  visited.add(visit_key)
+                  request_count += 1
+
+                  request = urllib.request.Request(
+                      url,
+                      data=data if method == "POST" else None,
+                      headers=request_headers(referer, method),
+                      method=method,
+                  )
+
+                  try:
+                      with opener.open(request, timeout=60) as response:
+                          final_url = response.geturl()
+                          if not is_public_http_url(final_url):
+                              continue
+                          result_type, payload = consume_response(response)
+                  except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError, ValueError):
+                      continue
+                  except Exception:
+                      continue
+
+                  if result_type == "file":
+                      return 0
+
+                  if depth >= MAX_DEPTH:
+                      continue
+
+                  queue.extend(build_candidates(payload, final_url, depth))
+
+              cleanup_partial()
+              return 1
+
+          try:
+              raise SystemExit(main())
+          except SystemExit:
+              raise
+          except BaseException:
+              cleanup_partial()
+              raise SystemExit(1)
+          PY
+            resolver_rc=$?
+
+            if [ "$resolver_rc" -eq 0 ] && [ -s "$output_file" ] && [ -s "$header_file" ]; then
+              echo "INTERMEDIATE_DOCUMENT_DOWNLOAD=success"
+              return 0
+            fi
+
+            rm -f "$output_file" "$header_file"
+            echo "INTERMEDIATE_DOCUMENT_DOWNLOAD_FAILED=1"
+            return 1
+          }
+
+          try_direct_document_download() {
+            set +e
+
+            if [ "${SEND_AS:-video}" != "document" ]; then
+              return 1
+            fi
+
+            local header_file
+            local file_name
+            local header_file_name
+            local output_file
+            local size_bytes
+            local actual_file_name
+            local actual_output_file
+            local html_check
+            local resolver_output_file
+            local resolver_header_file
+            local document_attempt_label
+
+            header_file="work/direct-document.headers"
+            document_attempt_label="direct-document"
+            file_name="$(safe_document_file_name_from_url "$SOURCE_URL")"
+            file_name="$(sanitize_document_file_name "" "$file_name")"
+            output_file="work/${file_name}"
+            mask_if_set "$file_name"
+            mask_if_set "$output_file"
+
+            rm -f "$header_file" "$output_file"
+
+            progress_stage "direct_document_probe" "30" "Checking" "Checking_direct_file_link"
+
+            if curl -fsSLI \
+              --connect-timeout 20 \
+              --max-time 60 \
+              --max-redirs 10 \
+              --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+              --referer "$REFERER_URL" \
+              -H "Accept-Language: en-US,en;q=0.9" \
+              "$SOURCE_URL" > "$header_file" 2>/dev/null; then
+
+              header_file_name="$(document_file_name_from_headers "$header_file")"
+
+              if [ -n "$header_file_name" ]; then
+                file_name="$(sanitize_document_file_name "" "$header_file_name")"
+                output_file="work/${file_name}"
+                mask_if_set "$header_file_name"
+                mask_if_set "$file_name"
+                mask_if_set "$output_file"
+                rm -f "$output_file"
+              fi
+
+              echo "DIRECT_DOCUMENT_HEAD=ok"
+            else
+              echo "DIRECT_DOCUMENT_HEAD_FAILED=1"
+              rm -f "$header_file"
+            fi
+
+            progress_stage "downloading" "40" "Downloading" "Downloading_document"
+
+            if ! curl -sS -fL \
+              --connect-timeout 20 \
+              --max-time 21600 \
+              --max-redirs 10 \
+              --retry 2 \
+              --retry-delay 2 \
+              --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+              --referer "$REFERER_URL" \
+              -H "Accept-Language: en-US,en;q=0.9" \
+              -H "Accept: application/octet-stream,*/*" \
+              -D "$header_file" \
+              -o "$output_file" \
+              "$SOURCE_URL"; then
+              echo "DIRECT_DOCUMENT_DOWNLOAD_FAILED=1"
+              rm -f "$output_file"
+              return 1
+            fi
+
+            if [ ! -f "$output_file" ]; then
+              echo "DIRECT_DOCUMENT_OUTPUT_MISSING=1"
+              return 1
+            fi
+
+            size_bytes="$(stat -c%s "$output_file" 2>/dev/null || echo 0)"
+
+            if [ "$size_bytes" -le 0 ]; then
+              echo "DIRECT_DOCUMENT_EMPTY=1"
+              rm -f "$output_file"
+              return 1
+            fi
+
+            html_check="$(downloaded_document_looks_like_html "$output_file" "$header_file")"
+
+            if [ "$html_check" = "yes" ]; then
+              echo "DIRECT_DOCUMENT_REJECTED_HTML=1"
+              rm -f "$output_file"
+
+              resolver_output_file="work/intermediate-document.bin"
+              resolver_header_file="work/intermediate-document.headers"
+
+              progress_stage "resolving_document" "42" "Resolving" "Resolving_intermediate_download_page"
+
+              if ! try_intermediate_document_download "$resolver_output_file" "$resolver_header_file"; then
+                return 1
+              fi
+
+              output_file="$resolver_output_file"
+              header_file="$resolver_header_file"
+              document_attempt_label="intermediate-document"
+
+              size_bytes="$(stat -c%s "$output_file" 2>/dev/null || echo 0)"
+              if [ "$size_bytes" -le 0 ]; then
+                echo "INTERMEDIATE_DOCUMENT_EMPTY=1"
+                rm -f "$output_file" "$header_file"
+                return 1
+              fi
+
+              html_check="$(downloaded_document_looks_like_html "$output_file" "$header_file")"
+              if [ "$html_check" = "yes" ]; then
+                echo "INTERMEDIATE_DOCUMENT_REJECTED_HTML=1"
+                rm -f "$output_file" "$header_file"
+                return 1
+              fi
+            fi
+
+            actual_file_name="$(document_file_name_from_headers "$header_file")"
+
+            if [ -n "$actual_file_name" ]; then
+              actual_file_name="$(sanitize_document_file_name "" "$actual_file_name")"
+              actual_output_file="work/${actual_file_name}"
+              mask_if_set "$actual_file_name"
+              mask_if_set "$actual_output_file"
+
+              if [ "$actual_output_file" != "$output_file" ]; then
+                rm -f "$actual_output_file"
+                mv "$output_file" "$actual_output_file"
+                output_file="$actual_output_file"
+              fi
+            fi
+
+            size_bytes="$(stat -c%s "$output_file" 2>/dev/null || echo 0)"
+
+            echo "DIRECT_DOCUMENT_DOWNLOAD=success"
+            echo "DIRECT_DOCUMENT_FILE=masked"
+            echo "::add-mask::${size_bytes}"
+            echo "DIRECT_DOCUMENT_SIZE_BYTES=masked"
+
+            handle_downloaded_file "$output_file" "document" "$document_attempt_label"
+            return $?
+          }
+
+          ensure_document_fits_telegram_limit() {
+            local file_path="$1"
+
+            if [ ! -f "$file_path" ]; then
+              echo "ERROR: Telegram document file is missing."
+              return 1
+            fi
+
+            local size_bytes
+            size_bytes="$(stat -c%s "$file_path" 2>/dev/null || echo 0)"
+
+            if [ "$size_bytes" -le 0 ]; then
+              echo "ERROR: Telegram document file is empty."
+              return 1
+            fi
+
+            echo "::add-mask::${size_bytes}"
+            echo "TELEGRAM_DOCUMENT_SIZE_CHECK_BYTES=masked"
+            echo "TELEGRAM_DOCUMENT_LIMIT_BYTES=masked"
+
+            progress_stage "size_check" "72" "Checking" "Checking_document_size"
+
+            if [ "$size_bytes" -le "$LOCAL_BOT_API_MAX_BYTES" ]; then
+              echo "TELEGRAM_DOCUMENT_SIZE_CHECK=ok"
+              return 0
+            fi
+
+            echo "ERROR: Document is larger than Telegram Local Bot API limit."
+            return 1
+          }
+
+          prepare_document_send_files() {
+            set +e
+
+            local zip_path="$1"
+
+            if [ ! -f "$zip_path" ]; then
+              echo "ERROR: ZIP file is missing before send preparation."
+              return 1
+            fi
+
+            local zip_size
+            local manifest
+            local parts_count
+            local part_size
+            local part_path
+
+            zip_size="$(stat -c%s "$zip_path" 2>/dev/null || echo 0)"
+            manifest="work/document-send-files.txt"
+
+            rm -f "$manifest"
+
+            if [ "$zip_size" -le 0 ]; then
+              echo "ERROR: ZIP file is empty before send preparation."
+              return 1
+            fi
+
+            DOCUMENT_SPLIT_REQUIRED="0"
+            DOCUMENT_SPLIT_PARTS_COUNT="1"
+            DOCUMENT_SEND_MANIFEST="$manifest"
+            DOCUMENT_SPLIT_TOTAL_BYTES="$zip_size"
+
+            if [ "$zip_size" -le "$DOCUMENT_SPLIT_PART_BYTES" ]; then
+              printf '%s\n' "$zip_path" > "$manifest"
+              echo "DOCUMENT_SPLIT_REQUIRED=0"
+              echo "DOCUMENT_SEND_FILES=single"
+              return 0
+            fi
+
+            progress_stage "splitting_document" "74" "Splitting" "Splitting_large_document_zip"
+
+            python3 - "$zip_path" "$DOCUMENT_SPLIT_PART_BYTES" "$manifest" <<'PY'
+          import os
+          import sys
+
+          zip_path = sys.argv[1]
+          part_size = int(sys.argv[2])
+          manifest = sys.argv[3]
+
+          base_name = os.path.basename(zip_path)
+          base_dir = os.path.dirname(zip_path) or "."
+          base_root, _base_ext = os.path.splitext(base_name)
+          if not base_root:
+              base_root = "telegram_document"
+          buffer_size = 4 * 1024 * 1024
+          part_paths = []
+
+          with open(zip_path, "rb") as src:
+              index = 1
+              while True:
+                  part_path = os.path.join(base_dir, f"{base_name}.{index:03d}")
+                  written = 0
+
+                  with open(part_path, "wb") as dst:
+                      while written < part_size:
+                          chunk = src.read(min(buffer_size, part_size - written))
+                          if not chunk:
+                              break
+                          dst.write(chunk)
+                          written += len(chunk)
+
+                  if written <= 0:
+                      try:
+                          os.remove(part_path)
+                      except FileNotFoundError:
+                          pass
+                      break
+
+                  part_paths.append(part_path)
+                  index += 1
+
+          with open(manifest, "w", encoding="utf-8") as out:
+              for part_path in part_paths:
+                  out.write(part_path + "\n")
+          PY
+
+            if [ ! -f "$manifest" ]; then
+              echo "ERROR: Document split manifest is missing."
+              return 1
+            fi
+
+            parts_count="$(grep -c . "$manifest" 2>/dev/null || echo 0)"
+
+            if [ "$parts_count" -le 1 ]; then
+              echo "ERROR: Document split did not produce enough parts."
+              return 1
+            fi
+
+            while IFS= read -r part_path; do
+              if [ ! -f "$part_path" ]; then
+                echo "ERROR: A split document part is missing."
+                return 1
+              fi
+
+              part_size="$(stat -c%s "$part_path" 2>/dev/null || echo 0)"
+              if [ "$part_size" -le 0 ] || [ "$part_size" -gt "$LOCAL_BOT_API_MAX_BYTES" ]; then
+                echo "ERROR: A split document part has invalid size."
+                echo "::add-mask::${part_size}"
+                echo "DOCUMENT_PART_SIZE_BYTES=masked"
+                echo "DOCUMENT_PART_LIMIT_BYTES=masked"
+                return 1
+              fi
+
+              echo "::add-mask::${part_path}"
+              echo "::add-mask::$(basename "$part_path")"
+            done < "$manifest"
+
+            DOCUMENT_SPLIT_REQUIRED="1"
+            DOCUMENT_SPLIT_PARTS_COUNT="$parts_count"
+            DOCUMENT_SEND_MANIFEST="$manifest"
+            DOCUMENT_SPLIT_TOTAL_BYTES="$zip_size"
+
+            rm -f "$zip_path"
+
+            echo "DOCUMENT_SPLIT_REQUIRED=1"
+            echo "DOCUMENT_SPLIT_PARTS_COUNT=masked"
+            echo "DOCUMENT_SPLIT_PART_BYTES=masked"
+            echo "DOCUMENT_SEND_MANIFEST=masked"
+
+            return 0
+          }
+
+          telegram_send_split_notice() {
+            local parts_count="$1"
+            local total_bytes="$2"
+
+            local total_size_text
+            local text
+
+            total_size_text="$(format_bytes_for_telegram "${total_bytes:-0}")"
+
+            printf -v text '📦 <b>Large GitHub Document</b>\n\nThe ZIP is larger than Telegram single-file limit, so it will be sent in <b>%s parts</b>.\n\n📥 <b>Total Size:</b> <code>%s</code>\nℹ️ <i>Download all parts, then join them in order to restore the original ZIP.</i>' \
+              "$parts_count" \
+              "$total_size_text"
+
+            curl -sS \
+              --connect-timeout 10 \
+              --max-time 20 \
+              -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
+              -F "chat_id=${TELEGRAM_CHAT_ID}" \
+              -F "parse_mode=HTML" \
+              -F "disable_web_page_preview=true" \
+              -F "text=${text}" >/dev/null 2>&1 || true
+          }
+
+          send_document_parts_to_telegram() {
+            set +e
+
+            local manifest="$1"
+            local attempt_label="$2"
+
+            if [ ! -f "$manifest" ]; then
+              echo "ERROR: Document parts manifest is missing."
+              return 1
+            fi
+
+            local total_parts
+            local current_part
+            local part_path
+            local part_size
+            local api_base
+            local send_mode
+            local last_send_mode
+            local response_file
+            local http_code
+            local percent
+
+            total_parts="$(grep -c . "$manifest" 2>/dev/null || echo 0)"
+
+            if [ "$total_parts" -le 1 ]; then
+              echo "ERROR: Invalid split document parts count."
+              return 1
+            fi
+
+            echo "SENDING_SPLIT_DOCUMENT_TO_TELEGRAM=1"
+            echo "DOCUMENT_SPLIT_PARTS_COUNT=masked"
+            echo "DOCUMENT_SPLIT_TOTAL_BYTES=masked"
+
+            telegram_send_split_notice "$total_parts" "${DOCUMENT_SPLIT_TOTAL_BYTES:-0}"
+
+            current_part=0
+            last_send_mode="unknown"
+
+            while IFS= read -r part_path; do
+              current_part=$((current_part + 1))
+
+              if [ ! -f "$part_path" ]; then
+                echo "ERROR: Split document part is missing before send."
+                return 1
+              fi
+
+              part_size="$(stat -c%s "$part_path" 2>/dev/null || echo 0)"
+
+              if [ "$part_size" -le 0 ] || [ "$part_size" -gt "$LOCAL_BOT_API_MAX_BYTES" ]; then
+                echo "ERROR: Split document part size is invalid before send."
+                echo "DOCUMENT_PART_INDEX=masked"
+                echo "::add-mask::${part_size}"
+                echo "DOCUMENT_PART_SIZE_BYTES=masked"
+                return 1
+              fi
+
+              if [ "$part_size" -le "$DIRECT_TELEGRAM_MAX_BYTES" ]; then
+                api_base="https://api.telegram.org/bot${TELEGRAM_TOKEN}"
+                send_mode="public"
+              else
+                start_local_bot_api_server || return 1
+                api_base="http://127.0.0.1:8081/bot${TELEGRAM_TOKEN}"
+                send_mode="local"
+              fi
+
+              last_send_mode="$send_mode"
+
+              percent=$((90 + (current_part * 8 / total_parts)))
+              if [ "$percent" -gt 98 ]; then
+                percent=98
+              fi
+
+              echo "SENDING_DOCUMENT_PART=1"
+              echo "DOCUMENT_PART_INDEX=masked"
+              echo "DOCUMENT_PARTS_TOTAL=masked"
+              echo "::add-mask::${part_size}"
+              echo "DOCUMENT_PART_SIZE_BYTES=masked"
+              echo "DOCUMENT_PART_SEND_MODE=${send_mode}"
+              echo "DOCUMENT_PART_FILE=masked"
+
+              progress_stage "sending_part" "$percent" "Sending" "Sending_document_part"
+
+              telegram_edit_document_summary                 "✅ <b>GitHub Document part ${current_part}/${total_parts}</b>"                 "⏳ <i>Sending split ZIP part to Telegram...</i>"                 "$part_size"                 "$send_mode"                 "Document part"                 "$(basename "$part_path")"
+
+              response_file="$RUNNER_TEMP/telegram-document-part-${current_part}.json"
+              http_code="$(telegram_send_document_request_with_retry "$api_base" "$part_path" "$response_file" "document_part")"
+
+              echo "TELEGRAM_DOCUMENT_PART_HTTP_CODE=${http_code}"
+
+              if ! is_success_http_code "$http_code" || ! grep -q '"ok":true' "$response_file"; then
+                echo "Telegram document part send failed."
+                echo "Telegram response is hidden for public-log safety."
+                return 1
+              fi
+
+              rm -f "$part_path"
+            done < "$manifest"
+
+            echo "TELEGRAM_SEND=success"
+            echo "TELEGRAM_SEND_METHOD=document_parts"
+            echo "FINAL_RESULT=success"
+
+            progress_stage "sent" "98" "Finalizing" "Telegram_document_parts_send_completed"
+
+            telegram_edit_document_summary \
+              "✅ <b>GitHub Document completed</b>" \
+              "📦 <i>Sent as ${total_parts} split ZIP parts.</i>" \
+              "${DOCUMENT_SPLIT_TOTAL_BYTES:-0}" \
+              "${last_send_mode:-unknown}" \
+              "Document parts" \
+              "$(basename "${DOCUMENT_ZIP_FILE:-document.zip}")"
+
+            return 0
+          }
+
+          normalize_media_for_sharing() {
+            set +e
+
+            local input_file="$1"
+            local output_file="$2"
+
+            if [ ! -f "$input_file" ]; then
+              echo "ERROR: Normalize input file is missing."
+              return 1
+            fi
+
+            local input_size
+            input_size="$(stat -c%s "$input_file" 2>/dev/null || echo 0)"
+
+            if [ "$input_size" -le 0 ]; then
+              echo "ERROR: Normalize input file is empty."
+              return 1
+            fi
+
+            progress_stage "normalizing" "60" "Processing" "Normalizing_media"
+
+            local input_vcodec
+            local input_acodec
+            local input_pix_fmt
+
+            input_vcodec="$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 "$input_file" 2>/dev/null | head -n 1 || true)"
+            input_acodec="$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 "$input_file" 2>/dev/null | head -n 1 || true)"
+            input_pix_fmt="$(ffprobe -v error -select_streams v:0 -show_entries stream=pix_fmt -of default=noprint_wrappers=1:nokey=1 "$input_file" 2>/dev/null | head -n 1 || true)"
+
+            echo "NORMALIZE_MEDIA=1"
+            echo "INPUT_VIDEO_CODEC=masked"
+            echo "INPUT_AUDIO_CODEC=masked"
+            echo "INPUT_PIXEL_FORMAT=masked"
+
+            INPUT_VIDEO_CODEC_FINAL="${input_vcodec:-unknown}"
+            INPUT_AUDIO_CODEC_FINAL="${input_acodec:-none}"
+
+            local tmp_output
+            tmp_output="${output_file}.tmp.mp4"
+
+            rm -f "$output_file" "$tmp_output"
+
+            ffmpeg -hide_banner -loglevel error -y \
+              -i "$input_file" \
+              -map 0:v:0 -map 0:a:0? \
+              -vf "scale=w='if(gte(dar,1),min(1920,trunc(ih*dar/2)*2),-2)':h='if(gte(dar,1),-2,min(1920,trunc(iw/dar/2)*2))':flags=bicubic,setsar=1,format=yuv420p" \
+              -c:v libx264 \
+              -preset veryfast \
+              -crf 23 \
+              -c:a aac \
+              -profile:a aac_low \
+              -b:a 128k \
+              -ar 44100 \
+              -ac 2 \
+              -movflags +faststart \
+              "$tmp_output"
+
+            local rc=$?
+
+            if [ "$rc" -ne 0 ]; then
+              echo "ERROR: ffmpeg normalize failed. RC=${rc}"
+              rm -f "$tmp_output"
+              return 1
+            fi
+
+            if [ ! -f "$tmp_output" ]; then
+              echo "ERROR: Normalized output file is missing."
+              return 1
+            fi
+
+            local output_size
+            output_size="$(stat -c%s "$tmp_output" 2>/dev/null || echo 0)"
+
+            if [ "$output_size" -le 0 ]; then
+              echo "ERROR: Normalized output file is empty."
+              rm -f "$tmp_output"
+              return 1
+            fi
+
+            mv "$tmp_output" "$output_file"
+
+            local output_vcodec
+            local output_acodec
+            local output_pix_fmt
+
+            output_vcodec="$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 "$output_file" 2>/dev/null | head -n 1 || true)"
+            output_acodec="$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 "$output_file" 2>/dev/null | head -n 1 || true)"
+            output_pix_fmt="$(ffprobe -v error -select_streams v:0 -show_entries stream=pix_fmt -of default=noprint_wrappers=1:nokey=1 "$output_file" 2>/dev/null | head -n 1 || true)"
+
+            echo "NORMALIZE_SUCCESS=1"
+            echo "OUTPUT_VIDEO_CODEC=masked"
+            echo "OUTPUT_AUDIO_CODEC=masked"
+            echo "OUTPUT_PIXEL_FORMAT=masked"
+            echo "::add-mask::${output_size}"
+            echo "OUTPUT_SIZE_BYTES=masked"
+
+            OUTPUT_VIDEO_CODEC_FINAL="${output_vcodec:-unknown}"
+            OUTPUT_AUDIO_CODEC_FINAL="${output_acodec:-none}"
+            OUTPUT_SIZE_BYTES_FINAL="${output_size}"
+
+            progress_stage "normalized" "68" "Processed" "Media_normalized"
+
+            return 0
+          }
+
+          prepare_media_without_reencode_if_safe() {
+            set +e
+
+            local input_file="$1"
+            local output_file="$2"
+
+            if [ ! -f "$input_file" ]; then
+              return 1
+            fi
+
+            local input_size
+            input_size="$(stat -c%s "$input_file" 2>/dev/null || echo 0)"
+
+            if [ "$input_size" -le 0 ]; then
+              return 1
+            fi
+
+            local input_format
+            local input_vcodec
+            local input_acodec
+            local input_pix_fmt
+
+            input_format="$(ffprobe -v error -show_entries format=format_name -of default=noprint_wrappers=1:nokey=1 "$input_file" 2>/dev/null | head -n 1 || true)"
+            input_vcodec="$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 "$input_file" 2>/dev/null | head -n 1 || true)"
+            input_acodec="$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 "$input_file" 2>/dev/null | head -n 1 || true)"
+            input_pix_fmt="$(ffprobe -v error -select_streams v:0 -show_entries stream=pix_fmt -of default=noprint_wrappers=1:nokey=1 "$input_file" 2>/dev/null | head -n 1 || true)"
+
+            INPUT_VIDEO_CODEC_FINAL="${input_vcodec:-unknown}"
+            INPUT_AUDIO_CODEC_FINAL="${input_acodec:-none}"
+
+            echo "FAST_REPACK_CHECK=1"
+            echo "INPUT_CONTAINER=masked"
+            echo "INPUT_VIDEO_CODEC=masked"
+            echo "INPUT_AUDIO_CODEC=masked"
+            echo "INPUT_PIXEL_FORMAT=masked"
+
+            if ! echo "${input_format:-}" | grep -Eq '(^|,)mp4(,|$)'; then
+              echo "FAST_REPACK_SKIP=container_not_mp4"
+              return 1
+            fi
+
+            if [ "${input_vcodec:-}" != "h264" ]; then
+              echo "FAST_REPACK_SKIP=video_codec_not_h264"
+              return 1
+            fi
+
+            if [ -n "${input_acodec:-}" ] && [ "$input_acodec" != "aac" ]; then
+              echo "FAST_REPACK_SKIP=audio_codec_not_aac"
+              return 1
+            fi
+
+            if [ "${input_pix_fmt:-}" != "yuv420p" ]; then
+              echo "FAST_REPACK_SKIP=pixel_format_not_yuv420p"
+              return 1
+            fi
+
+            progress_stage "fast_repack" "60" "Processing" "Fast_repack_no_reencode"
+
+            local tmp_output
+            tmp_output="${output_file}.tmp.mp4"
+
+            rm -f "$output_file" "$tmp_output"
+
+            ffmpeg -hide_banner -loglevel error -y \
+              -i "$input_file" \
+              -map 0:v:0 -map 0:a:0? \
+              -c copy \
+              -movflags +faststart \
+              "$tmp_output"
+
+            local rc
+            rc=$?
+
+            if [ "$rc" -ne 0 ]; then
+              echo "FAST_REPACK_FAILED=1"
+              echo "FAST_REPACK_RC=${rc}"
+              rm -f "$tmp_output"
+              return 1
+            fi
+
+            if [ ! -f "$tmp_output" ]; then
+              echo "FAST_REPACK_OUTPUT_MISSING=1"
+              return 1
+            fi
+
+            local output_size
+            output_size="$(stat -c%s "$tmp_output" 2>/dev/null || echo 0)"
+
+            if [ "$output_size" -le 0 ]; then
+              echo "FAST_REPACK_OUTPUT_EMPTY=1"
+              rm -f "$tmp_output"
+              return 1
+            fi
+
+            mv "$tmp_output" "$output_file"
+
+            local output_vcodec
+            local output_acodec
+
+            output_vcodec="$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 "$output_file" 2>/dev/null | head -n 1 || true)"
+            output_acodec="$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 "$output_file" 2>/dev/null | head -n 1 || true)"
+
+            echo "FAST_REPACK_SUCCESS=1"
+            echo "OUTPUT_VIDEO_CODEC=masked"
+            echo "OUTPUT_AUDIO_CODEC=masked"
+            echo "::add-mask::${output_size}"
+            echo "OUTPUT_SIZE_BYTES=masked"
+
+            OUTPUT_VIDEO_CODEC_FINAL="${output_vcodec:-unknown}"
+            OUTPUT_AUDIO_CODEC_FINAL="${output_acodec:-none}"
+            OUTPUT_SIZE_BYTES_FINAL="${output_size}"
+
+            progress_stage "fast_repacked" "68" "Processed" "Media_repacked_no_reencode"
+
+            return 0
+          }
+
+          media_has_audio_stream() {
+            local file_path="$1"
+
+            if [ ! -f "$file_path" ]; then
+              return 1
+            fi
+
+            local audio_count
+            audio_count="$(
+              ffprobe -v error \
+                -select_streams a \
+                -show_entries stream=index \
+                -of csv=p=0 \
+                "$file_path" 2>/dev/null | grep -c . || true
+            )"
+
+            [ "${audio_count:-0}" -gt 0 ]
+          }
+
+          get_media_duration_seconds() {
+            local file_path="$1"
+
+            ffprobe -v error \
+              -show_entries format=duration \
+              -of default=noprint_wrappers=1:nokey=1 \
+              "$file_path" 2>/dev/null | head -n 1 || true
+          }
+
+          get_audio_bitrate_bps() {
+            local file_path="$1"
+            local audio_bitrate
+
+            audio_bitrate="$(
+              ffprobe -v error \
+                -select_streams a:0 \
+                -show_entries stream=bit_rate \
+                -of default=noprint_wrappers=1:nokey=1 \
+                "$file_path" 2>/dev/null | head -n 1 || true
+            )"
+
+            if echo "$audio_bitrate" | grep -Eq '^[0-9]+$'; then
+              echo "$audio_bitrate"
+            else
+              echo "128000"
+            fi
+          }
+
+          get_video_height() {
+            local file_path="$1"
+            local video_height
+
+            video_height="$(
+              ffprobe -v error \
+                -select_streams v:0 \
+                -show_entries stream=height \
+                -of default=noprint_wrappers=1:nokey=1 \
+                "$file_path" 2>/dev/null | head -n 1 || true
+            )"
+
+            if echo "$video_height" | grep -Eq '^[0-9]+$'; then
+              echo "$video_height"
+            else
+              echo "0"
+            fi
+          }
+
+          calc_target_video_bitrate_kbps() {
+            local duration_seconds="$1"
+            local target_bytes="$2"
+            local audio_bitrate_bps="$3"
+
+            python3 -c 'import sys; duration=float(sys.argv[1]); target_bytes=int(sys.argv[2]); audio_bps=int(sys.argv[3]); video_kbps=0 if duration<=0 or target_bytes<=0 else int((((target_bytes*8.0/duration)*0.97)-audio_bps)/1000); print(max(video_kbps, 150) if video_kbps>0 else 0)' "$duration_seconds" "$target_bytes" "$audio_bitrate_bps" 2>/dev/null || echo 0
+          }
+
+          compress_media_to_fit_telegram_limit() {
+            set +e
+
+            local file_path="$1"
+
+            if [ ! -f "$file_path" ]; then
+              echo "ERROR: Size-fit input file is missing."
+              return 1
+            fi
+
+            local original_size
+            original_size="$(stat -c%s "$file_path" 2>/dev/null || echo 0)"
+
+            if [ "$original_size" -le "$LOCAL_BOT_API_MAX_BYTES" ]; then
+              echo "SIZE_FIT_REQUIRED=0"
+              return 0
+            fi
+
+            echo "SIZE_FIT_REQUIRED=1"
+            echo "::add-mask::${original_size}"
+            echo "SIZE_FIT_ORIGINAL_BYTES=masked"
+            echo "SIZE_FIT_LIMIT_BYTES=masked"
+            echo "SIZE_FIT_TARGET_BYTES=masked"
+
+            progress_stage "size_fit" "78" "Reducing" "Reducing_size_to_fit"
+
+            local duration_seconds
+            local audio_bitrate_bps
+            local video_height
+            local target_video_kbps
+
+            duration_seconds="$(get_media_duration_seconds "$file_path")"
+            audio_bitrate_bps="$(get_audio_bitrate_bps "$file_path")"
+            video_height="$(get_video_height "$file_path")"
+            target_video_kbps="$(calc_target_video_bitrate_kbps "$duration_seconds" "$TELEGRAM_TARGET_MAX_BYTES" "$audio_bitrate_bps")"
+
+            echo "SIZE_FIT_DURATION_SECONDS=masked"
+            echo "SIZE_FIT_AUDIO_BITRATE_BPS=masked"
+            echo "SIZE_FIT_SOURCE_HEIGHT=masked"
+            echo "SIZE_FIT_TARGET_VIDEO_KBPS=masked"
+
+            if ! echo "$target_video_kbps" | grep -Eq '^[0-9]+$'; then
+              echo "ERROR: Could not calculate target video bitrate."
+              return 1
+            fi
+
+            if [ "$target_video_kbps" -le 0 ]; then
+              echo "ERROR: Invalid target video bitrate."
+              return 1
+            fi
+
+            local target_height
+            local tmp_output
+            local output_size
+            local scale_filter
+            local candidate_heights
+
+            candidate_heights="2160 1440 1080 720 480 360"
+
+            for target_height in $candidate_heights; do
+              if [ "$video_height" -gt 0 ] && [ "$target_height" -gt "$video_height" ]; then
+                continue
+              fi
+
+              tmp_output="${file_path}.fit-${target_height}.tmp.mp4"
+              rm -f "$tmp_output"
+
+              echo "SIZE_FIT_ATTEMPT_HEIGHT=masked"
+
+              scale_filter="scale=-2:${target_height}:force_original_aspect_ratio=decrease,format=yuv420p"
+
+              ffmpeg -hide_banner -loglevel error -y \
+                -i "$file_path" \
+                -map 0:v:0 -map 0:a:0? \
+                -vf "$scale_filter" \
+                -c:v libx264 \
+                -preset veryfast \
+                -b:v "${target_video_kbps}k" \
+                -maxrate "${target_video_kbps}k" \
+                -bufsize "$((target_video_kbps * 2))k" \
+                -c:a copy \
+                -movflags +faststart \
+                "$tmp_output"
+
+              local rc=$?
+
+              if [ "$rc" -ne 0 ]; then
+                echo "SIZE_FIT_FFMPEG_FAILED=1"
+                echo "SIZE_FIT_HEIGHT=masked"
+                echo "SIZE_FIT_RC=${rc}"
+                rm -f "$tmp_output"
+                continue
+              fi
+
+              if [ ! -f "$tmp_output" ]; then
+                echo "SIZE_FIT_OUTPUT_MISSING=1"
+                echo "SIZE_FIT_HEIGHT=masked"
+                continue
+              fi
+
+              output_size="$(stat -c%s "$tmp_output" 2>/dev/null || echo 0)"
+
+              echo "::add-mask::${output_size}"
+              echo "SIZE_FIT_OUTPUT_BYTES=masked"
+              echo "SIZE_FIT_OUTPUT_HEIGHT=masked"
+
+              if [ "$output_size" -gt 0 ] && [ "$output_size" -le "$LOCAL_BOT_API_MAX_BYTES" ]; then
+                mv "$tmp_output" "$file_path"
+                echo "SIZE_FIT_SUCCESS=1"
+                echo "SIZE_FIT_FINAL_BYTES=masked"
+                echo "SIZE_FIT_FINAL_HEIGHT=masked"
+                echo "SIZE_FIT_AUDIO_MODE=masked"
+
+                SIZE_FIT_APPLIED_FINAL="1"
+                SIZE_FIT_FINAL_HEIGHT_FINAL="${target_height}"
+                SIZE_FIT_AUDIO_MODE_FINAL="copy"
+                FINAL_SIZE_STATUS="Reduced to fit"
+
+                progress_stage "size_fit_done" "82" "Reduced" "Size_fit_completed"
+
+                return 0
+              fi
+
+              rm -f "$tmp_output"
+            done
+
+            echo "SIZE_FIT_SUCCESS=0"
+            echo "ERROR: Could not reduce media below Telegram Local Bot API limit without lowering audio."
+            return 1
+          }
+
+          ensure_media_fits_telegram_limit() {
+            local file_path="$1"
+
+            if [ ! -f "$file_path" ]; then
+              echo "ERROR: Telegram size check file is missing."
+              return 1
+            fi
+
+            local size_bytes
+            size_bytes="$(stat -c%s "$file_path" 2>/dev/null || echo 0)"
+
+            if [ "$size_bytes" -le 0 ]; then
+              echo "ERROR: Telegram size check file is empty."
+              return 1
+            fi
+
+            echo "::add-mask::${size_bytes}"
+            echo "TELEGRAM_SIZE_CHECK_BYTES=masked"
+            echo "TELEGRAM_SIZE_LIMIT_BYTES=masked"
+
+            progress_stage "size_check" "72" "Checking" "Checking_final_size"
+
+            if [ "$size_bytes" -le "$LOCAL_BOT_API_MAX_BYTES" ]; then
+              echo "TELEGRAM_SIZE_CHECK=ok"
+              return 0
+            fi
+
+            compress_media_to_fit_telegram_limit "$file_path"
+            return $?
+          }
+
+          start_local_bot_api_server() {
+            if [ "${LOCAL_BOT_API_STARTED:-0}" = "1" ]; then
+              return 0
+            fi
+
+            if [ -z "${TELEGRAM_API_ID:-}" ] || [ -z "${TELEGRAM_API_HASH:-}" ]; then
+              echo "ERROR: Large Telegram upload requires TELEGRAM_API_ID and TELEGRAM_API_HASH secrets."
+              return 1
+            fi
+
+            if ! command -v telegram-bot-api >/dev/null 2>&1; then
+              echo "ERROR: telegram-bot-api is missing from worker image."
+              return 1
+            fi
+
+            local api_dir
+            local api_log
+            local i
+            local port_http_code
+
+            api_dir="$RUNNER_TEMP/telegram-bot-api"
+            api_log="$RUNNER_TEMP/telegram-bot-api.log"
+
+            mkdir -p "$api_dir"
+
+            echo "STARTING_LOCAL_BOT_API=1"
+
+            progress_stage "starting_local_bot_api" "85" "Starting_sender" "Starting_Local_Bot_API"
+
+            telegram-bot-api \
+              --api-id="${TELEGRAM_API_ID}" \
+              --api-hash="${TELEGRAM_API_HASH}" \
+              --local \
+              --http-ip-address=127.0.0.1 \
+              --http-port=8081 \
+              --dir="$api_dir" > "$api_log" 2>&1 &
+
+            TELEGRAM_BOT_API_PID="$!"
+            export TELEGRAM_BOT_API_PID
+
+            for i in $(seq 1 90); do
+              if ! kill -0 "$TELEGRAM_BOT_API_PID" >/dev/null 2>&1; then
+                echo "ERROR: Local Bot API process exited before becoming ready."
+                return 1
+              fi
+
+              port_http_code="$(
+                curl -sS \
+                  --connect-timeout 1 \
+                  --max-time 2 \
+                  -o /dev/null \
+                  -w "%{http_code}" \
+                  "http://127.0.0.1:8081/" 2>/dev/null || true
+              )"
+
+              if [ -n "$port_http_code" ] && [ "$port_http_code" != "000" ]; then
+                echo "LOCAL_BOT_API_READY=1"
+                LOCAL_BOT_API_STARTED="1"
+
+                progress_stage "local_bot_api_ready" "88" "Sender_ready" "Local_Bot_API_ready"
+
+                return 0
+              fi
+
+              if [ "$i" = "1" ] || [ "$i" = "30" ] || [ "$i" = "60" ] || [ "$i" = "90" ]; then
+                echo "LOCAL_BOT_API_WAIT=${i}/90"
+                echo "LOCAL_BOT_API_PROCESS=alive"
+                echo "LOCAL_BOT_API_PORT_HTTP_CODE=${port_http_code:-000}"
+              fi
+
+              sleep 1
+            done
+
+            echo "ERROR: Local Bot API server did not become ready."
+            return 1
+          }
+
+          is_success_http_code() {
+            case "$1" in
+              2*)
+                return 0
+                ;;
+              *)
+                return 1
+                ;;
+            esac
+          }
+
+          telegram_send_video_request() {
+            local api_base="$1"
+            local file_path="$2"
+            local response_file="$3"
+
+            local video_width
+            local video_height
+            local form_args
+
+            video_width="$(
+              ffprobe -v error \
+                -select_streams v:0 \
+                -show_entries stream=width \
+                -of default=noprint_wrappers=1:nokey=1 \
+                "$file_path" 2>/dev/null | head -n 1 || true
+            )"
+
+            video_height="$(
+              ffprobe -v error \
+                -select_streams v:0 \
+                -show_entries stream=height \
+                -of default=noprint_wrappers=1:nokey=1 \
+                "$file_path" 2>/dev/null | head -n 1 || true
+            )"
+
+            form_args=(
+              -F "chat_id=${TELEGRAM_CHAT_ID}"
+              -F "supports_streaming=true"
+              -F "video=@${file_path}"
+            )
+
+            if echo "${video_width:-}" | grep -Eq '^[0-9]+$' && echo "${video_height:-}" | grep -Eq '^[0-9]+$'; then
+              form_args+=(
+                -F "width=${video_width}"
+                -F "height=${video_height}"
+              )
+            fi
+
+            curl -sS \
+              --connect-timeout 20 \
+              --max-time 1800 \
+              -o "$response_file" \
+              -w "%{http_code}" \
+              -X POST "${api_base}/sendVideo" \
+              "${form_args[@]}"
+          }
+
+          telegram_send_document_request() {
+            local api_base="$1"
+            local file_path="$2"
+            local response_file="$3"
+
+            curl -sS \
+              --connect-timeout 20 \
+              --max-time 7200 \
+              -o "$response_file" \
+              -w "%{http_code}" \
+              -X POST "${api_base}/sendDocument" \
+              -F "chat_id=${TELEGRAM_CHAT_ID}" \
+              -F "document=@${file_path}"
+          }
+
+          telegram_retry_after_seconds() {
+            local response_file="$1"
+            local retry_after
+
+            retry_after="$(
+              sed -nE 's/.*"retry_after"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$response_file" 2>/dev/null | head -n 1
+            )"
+
+            if ! echo "${retry_after:-}" | grep -Eq '^[0-9]+$'; then
+              retry_after="20"
+            fi
+
+            if [ "$retry_after" -lt 5 ]; then
+              retry_after="5"
+            fi
+
+            if [ "$retry_after" -gt 600 ]; then
+              retry_after="600"
+            fi
+
+            printf "%s" "$retry_after"
+          }
+
+          telegram_send_document_request_with_retry() {
+            local api_base="$1"
+            local file_path="$2"
+            local response_file="$3"
+            local attempt_label="${4:-document}"
+
+            local max_attempts
+            local attempt
+            local http_code
+            local retry_after
+
+            max_attempts=5
+            attempt=1
+            http_code="000"
+
+            while [ "$attempt" -le "$max_attempts" ]; do
+              rm -f "$response_file"
+
+              http_code="$(telegram_send_document_request "$api_base" "$file_path" "$response_file")"
+
+              case "$http_code" in
+                429|000|408|500|502|503|504)
+                  ;;
+                *)
+                  printf "%s" "$http_code"
+                  return 0
+                  ;;
+              esac
+
+              if [ "$attempt" -ge "$max_attempts" ]; then
+                printf "%s" "$http_code"
+                return 0
+              fi
+
+              if [ "$http_code" = "429" ]; then
+                retry_after="$(telegram_retry_after_seconds "$response_file")"
+              else
+                retry_after="20"
+              fi
+
+              echo "TELEGRAM_SEND_RETRY=1" >&2
+              echo "TELEGRAM_RETRY_CONTEXT=${attempt_label}" >&2
+              echo "TELEGRAM_RETRY_HTTP_CODE=${http_code}" >&2
+              echo "TELEGRAM_RETRY_ATTEMPT=masked" >&2
+              echo "::add-mask::${retry_after}" >&2
+              echo "TELEGRAM_RETRY_AFTER_SECONDS=masked" >&2
+
+              progress_stage "telegram_send_retry" "95" "Waiting" "Telegram_send_retry" >&2
+
+              sleep "$retry_after"
+              attempt=$((attempt + 1))
+            done
+
+            printf "%s" "$http_code"
+            return 0
+          }
+
+          telegram_send_video_request_with_retry() {
+            local api_base="$1"
+            local file_path="$2"
+            local response_file="$3"
+            local attempt_label="${4:-video}"
+
+            local max_attempts
+            local attempt
+            local http_code
+            local retry_after
+
+            max_attempts=5
+            attempt=1
+            http_code="000"
+
+            while [ "$attempt" -le "$max_attempts" ]; do
+              rm -f "$response_file"
+
+              http_code="$(telegram_send_video_request "$api_base" "$file_path" "$response_file")"
+
+              case "$http_code" in
+                429|000|408|500|502|503|504)
+                  ;;
+                *)
+                  printf "%s" "$http_code"
+                  return 0
+                  ;;
+              esac
+
+              if [ "$attempt" -ge "$max_attempts" ]; then
+                printf "%s" "$http_code"
+                return 0
+              fi
+
+              if [ "$http_code" = "429" ]; then
+                retry_after="$(telegram_retry_after_seconds "$response_file")"
+              else
+                retry_after="20"
+              fi
+
+              echo "TELEGRAM_SEND_RETRY=1" >&2
+              echo "TELEGRAM_RETRY_CONTEXT=${attempt_label}" >&2
+              echo "TELEGRAM_RETRY_HTTP_CODE=${http_code}" >&2
+              echo "TELEGRAM_RETRY_ATTEMPT=masked" >&2
+              echo "::add-mask::${retry_after}" >&2
+              echo "TELEGRAM_RETRY_AFTER_SECONDS=masked" >&2
+
+              progress_stage "telegram_send_retry" "95" "Waiting" "Telegram_send_retry" >&2
+
+              sleep "$retry_after"
+              attempt=$((attempt + 1))
+            done
+
+            printf "%s" "$http_code"
+            return 0
+          }
+
+          send_to_telegram() {
+            local file_path="$1"
+            local success_height="$2"
+            local attempt_label="$3"
+
+            if [ ! -f "$file_path" ]; then
+              echo "ERROR: Telegram send file is missing."
+              return 1
+            fi
+
+            local size_bytes
+            size_bytes="$(stat -c%s "$file_path")"
+
+            if [ "$size_bytes" -le 0 ]; then
+              echo "ERROR: File is empty."
+              return 1
+            fi
+
+            if [ "$size_bytes" -gt "$LOCAL_BOT_API_MAX_BYTES" ]; then
+              echo "SKIP: File is larger than Local Bot API limit. SIZE_BYTES=masked"
+              return 2
+            fi
+
+            local api_base
+            local send_mode
+            local response_file
+            local http_code
+
+            if [ "$size_bytes" -le "$DIRECT_TELEGRAM_MAX_BYTES" ]; then
+              api_base="https://api.telegram.org/bot${TELEGRAM_TOKEN}"
+              send_mode="public"
+            else
+              start_local_bot_api_server || return 1
+              api_base="http://127.0.0.1:8081/bot${TELEGRAM_TOKEN}"
+              send_mode="local"
+            fi
+
+            echo "SENDING_TO_TELEGRAM=1"
+            echo "TELEGRAM_SEND_MODE=${send_mode}"
+            echo "SELECTED_FILE=masked"
+            echo "SELECTED_HEIGHT=masked"
+            echo "SELECTED_ATTEMPT=${attempt_label}"
+            echo "SELECTED_SIZE_BYTES=masked"
+
+            if [ "${SEND_AS:-video}" = "document" ]; then
+              echo "REMOTE_DOCUMENT_READY=1"
+              echo "READY_TO_SEND=1"
+              echo "READY_SIZE_BYTES=masked"
+              echo "READY_ATTEMPT=${attempt_label}"
+              echo "READY_SEND_MODE=${send_mode}"
+              echo "READY_SEND_METHOD=document"
+
+              progress_stage "ready_to_send" "90" "Ready" "Document_ready_to_send"
+
+              telegram_edit_document_summary \
+                "✅ <b>GitHub Document ready</b>" \
+                "⏳ <i>Sending to Telegram...</i>" \
+                "$size_bytes" \
+                "$send_mode" \
+                "Document" \
+                "$(basename "$file_path")"
+
+              # Give Telegram progress message enough time to update before the document arrives.
+              sleep 5
+
+              echo "PROGRESS_STAGE=sending"
+              echo "PROGRESS_PERCENT=95"
+              echo "PROGRESS_LABEL=Sending"
+              echo "PROGRESS_DETAIL=Sending_document_to_Telegram"
+
+              response_file="$RUNNER_TEMP/telegram-document-response.json"
+              http_code="$(telegram_send_document_request_with_retry "$api_base" "$file_path" "$response_file" "document")"
+
+              echo "TELEGRAM_DOCUMENT_HTTP_CODE=${http_code}"
+
+              if is_success_http_code "$http_code" && grep -q '"ok":true' "$response_file"; then
+                echo "TELEGRAM_SEND=success"
+                echo "TELEGRAM_SEND_METHOD=document"
+                echo "FINAL_RESULT=success"
+
+                echo "PROGRESS_STAGE=sent"
+                echo "PROGRESS_PERCENT=98"
+                echo "PROGRESS_LABEL=Finalizing"
+                echo "PROGRESS_DETAIL=Telegram_document_send_completed"
+
+                telegram_edit_document_summary \
+                  "✅ <b>GitHub Document completed</b>" \
+                  "" \
+                  "$size_bytes" \
+                  "$send_mode" \
+                  "Document" \
+                  "$(basename "$file_path")"
+
+                return 0
+              fi
+
+              echo "Telegram document send failed."
+              echo "Telegram response is hidden for public-log safety."
+              return 1
+            fi
+
+            echo "REMOTE_MEDIA_READY=1"
+            echo "READY_TO_SEND=1"
+            echo "READY_SIZE_BYTES=masked"
+            echo "READY_HEIGHT=masked"
+            echo "READY_ATTEMPT=${attempt_label}"
+            echo "READY_SEND_MODE=${send_mode}"
+            echo "READY_SEND_METHOD=video"
+
+            progress_stage "ready_to_send" "90" "Ready" "Media_ready_to_send"
+
+            telegram_edit_summary \
+              "✅ <b>GitHub Remote ready</b>" \
+              "⏳ <i>Sending to Telegram...</i>" \
+              "$size_bytes" \
+              "$success_height" \
+              "$send_mode" \
+              "Video"
+
+            # Give Telegram progress message enough time to update before the video arrives.
+            sleep 5
+
+            echo "PROGRESS_STAGE=sending"
+            echo "PROGRESS_PERCENT=95"
+            echo "PROGRESS_LABEL=Sending"
+            echo "PROGRESS_DETAIL=Sending_to_Telegram"
+
+            response_file="$RUNNER_TEMP/telegram-response.json"
+
+            http_code="$(telegram_send_video_request_with_retry "$api_base" "$file_path" "$response_file" "video")"
+
+            echo "TELEGRAM_HTTP_CODE=${http_code}"
+
+            if is_success_http_code "$http_code" && grep -q '"ok":true' "$response_file"; then
+              echo "TELEGRAM_SEND=success"
+              echo "TELEGRAM_SEND_METHOD=video"
+              echo "FINAL_RESULT=success"
+
+              echo "PROGRESS_STAGE=sent"
+              echo "PROGRESS_PERCENT=98"
+              echo "PROGRESS_LABEL=Finalizing"
+              echo "PROGRESS_DETAIL=Telegram_send_completed"
+
+              telegram_edit_summary \
+                "✅ <b>GitHub Remote completed</b>" \
+                "" \
+                "$size_bytes" \
+                "$success_height" \
+                "$send_mode" \
+                "Video"
+
+              return 0
+            fi
+
+            if [ "$send_mode" = "local" ]; then
+              echo "LOCAL_SEND_VIDEO_FAILED=1"
+              echo "TRY_SEND_DOCUMENT_FALLBACK=1"
+
+              progress_stage "sending_fallback" "95" "Sending" "Sending_as_document_fallback"
+
+              response_file="$RUNNER_TEMP/telegram-document-response.json"
+              http_code="$(telegram_send_document_request_with_retry "$api_base" "$file_path" "$response_file" "video_document_fallback")"
+
+              echo "TELEGRAM_DOCUMENT_HTTP_CODE=${http_code}"
+
+              if is_success_http_code "$http_code" && grep -q '"ok":true' "$response_file"; then
+                echo "TELEGRAM_SEND=success"
+                echo "TELEGRAM_SEND_METHOD=document"
+                echo "FINAL_RESULT=success"
+
+                echo "PROGRESS_STAGE=sent"
+                echo "PROGRESS_PERCENT=98"
+                echo "PROGRESS_LABEL=Finalizing"
+                echo "PROGRESS_DETAIL=Telegram_send_completed"
+
+                telegram_edit_summary \
+                  "✅ <b>GitHub Remote completed</b>" \
+                  "" \
+                  "$size_bytes" \
+                  "$success_height" \
+                  "$send_mode" \
+                  "Document fallback"
+
+                return 0
+              fi
+            fi
+
+            echo "Telegram send failed."
+            echo "Telegram response is hidden for public-log safety."
+            return 1
+          }
+
+          is_dns_failure_log() {
+            local log_file="$1"
+
+            grep -Eqi "Failed to resolve|Address family for hostname not supported|Temporary failure in name resolution|Name or service not known" "$log_file"
+          }
+
+          is_rate_limit_log() {
+            local log_file="$1"
+
+            grep -Eqi "HTTP Error 429|HTTPError 429|Too Many Requests" "$log_file"
+          }
+
+          handle_downloaded_file() {
+            set +e
+
+            local file_path="$1"
+            local success_height="$2"
+            local attempt_label="$3"
+
+            if [ ! -f "$file_path" ]; then
+              return 1
+            fi
+
+            local size_bytes
+            size_bytes="$(stat -c%s "$file_path")"
+
+            if [ "$size_bytes" -le 0 ]; then
+              echo "Downloaded file is empty."
+              return 1
+            fi
+
+            echo "DOWNLOAD_SUCCESS=1"
+            echo "DOWNLOAD_SUCCESS_HEIGHT=masked"
+            echo "DOWNLOAD_SUCCESS_ATTEMPT=${attempt_label}"
+            echo "::add-mask::${size_bytes}"
+            echo "DOWNLOAD_SIZE_BYTES=masked"
+
+            DOWNLOAD_SIZE_BYTES_FINAL="${size_bytes}"
+
+            progress_stage "downloaded" "50" "Downloaded" "Download_completed"
+
+            timestamp="$(TZ=Africa/Cairo date '+%Y-%m-%d_%H-%M-%S')"
+            file_ext="${file_path##*.}"
+
+            if [ -z "$file_ext" ] || [ "$file_ext" = "$file_path" ]; then
+              file_ext="mp4"
+            fi
+
+            if [ "${SEND_AS:-video}" = "document" ]; then
+              fallback_document_name="$(basename "$file_path")"
+              source_file="work/$(sanitize_document_file_name "" "$fallback_document_name")"
+            else
+              source_file="work/source_${timestamp}_${PLATFORM}.${file_ext}"
+            fi
+
+            final_file="work/media_${timestamp}_${PLATFORM}.mp4"
+
+            if [ "$file_path" != "$source_file" ]; then
+              rm -f "$source_file"
+              mv "$file_path" "$source_file"
+            fi
+
+            file_path="$source_file"
+
+            echo "RENAMED_FILE=masked"
+
+            if [ "${SEND_AS:-video}" = "video" ] && [ "$PLATFORM" = "tiktok" ]; then
+              if ! media_has_audio_stream "$file_path"; then
+                echo "TIKTOK_NO_AUDIO_STREAM=1"
+                echo "TikTok downloaded candidate has no audio stream. Trying another format."
+                rm -f "$file_path"
+                return 1
+              fi
+            fi
+
+            if [ "${SEND_AS:-video}" = "document" ]; then
+              FINAL_SIZE_STATUS="OK"
+              INPUT_VIDEO_CODEC_FINAL="Original"
+
+              if [ "${DOCUMENT_MODE:-zip}" = "original" ]; then
+                OUTPUT_VIDEO_CODEC_FINAL="Original"
+
+                document_file_name="$(sanitize_document_file_name "${OUTPUT_FILENAME:-}" "$(basename "$file_path")")"
+                document_file_path="work/${document_file_name}"
+
+                if [ "$file_path" != "$document_file_path" ]; then
+                  rm -f "$document_file_path"
+                  mv "$file_path" "$document_file_path"
+                  file_path="$document_file_path"
+                fi
+
+                DOWNLOAD_SIZE_BYTES_FINAL="$(stat -c%s "$file_path" 2>/dev/null || echo "$DOWNLOAD_SIZE_BYTES_FINAL")"
+
+                ensure_document_fits_telegram_limit "$file_path"
+                local original_document_fit_rc=$?
+
+                if [ "$original_document_fit_rc" -ne 0 ]; then
+                  echo "Original document exceeded Telegram limit or failed size check."
+                  exit 1
+                fi
+
+                send_to_telegram "$file_path" "document" "$attempt_label"
+                local original_document_send_rc=$?
+
+                if [ "$original_document_send_rc" -eq 0 ]; then
+                  exit 0
+                fi
+
+                echo "Telegram original document send failed after successful download."
+                exit 1
+              fi
+
+              OUTPUT_VIDEO_CODEC_FINAL="ZIP"
+              DOCUMENT_ZIP_FILE=""
+              DOCUMENT_ZIP_INNER_NAME=""
+
+              zip_document_for_telegram "$file_path" "${OUTPUT_FILENAME:-}" "$(basename "$file_path")"
+              local zip_rc=$?
+
+              if [ "$zip_rc" -ne 0 ] || [ -z "${DOCUMENT_ZIP_FILE:-}" ]; then
+                echo "Document ZIP creation failed."
+                exit 1
+              fi
+
+              DOWNLOAD_SIZE_BYTES_FINAL="$(stat -c%s "$file_path" 2>/dev/null || echo "$DOWNLOAD_SIZE_BYTES_FINAL")"
+              rm -f "$file_path"
+
+              prepare_document_send_files "$DOCUMENT_ZIP_FILE"
+              local document_prepare_rc=$?
+
+              if [ "$document_prepare_rc" -ne 0 ] || [ -z "${DOCUMENT_SEND_MANIFEST:-}" ]; then
+                echo "Document send preparation failed."
+                exit 1
+              fi
+
+              if [ "${DOCUMENT_SPLIT_REQUIRED:-0}" = "1" ]; then
+                send_document_parts_to_telegram "$DOCUMENT_SEND_MANIFEST" "$attempt_label"
+                local document_parts_send_rc=$?
+
+                if [ "$document_parts_send_rc" -eq 0 ]; then
+                  exit 0
+                fi
+
+                echo "Telegram split ZIP document send failed after successful download."
+                exit 1
+              fi
+
+              ensure_document_fits_telegram_limit "$DOCUMENT_ZIP_FILE"
+              local document_fit_rc=$?
+
+              if [ "$document_fit_rc" -ne 0 ]; then
+                echo "Document ZIP exceeded Telegram limit or failed size check."
+                exit 1
+              fi
+
+              send_to_telegram "$DOCUMENT_ZIP_FILE" "document" "$attempt_label"
+              local document_send_rc=$?
+
+              if [ "$document_send_rc" -eq 0 ]; then
+                exit 0
+              fi
+
+              echo "Telegram ZIP document send failed after successful download."
+              exit 1
+            fi
+
+            if prepare_media_without_reencode_if_safe "$file_path" "$final_file"; then
+              echo "MEDIA_PREPARE_MODE=fast_repack_no_reencode"
+            else
+              normalize_media_for_sharing "$file_path" "$final_file"
+              local normalize_rc=$?
+
+              if [ "$normalize_rc" -ne 0 ]; then
+                echo "Media normalize failed after successful download. Trying a lower or alternate format."
+                return 1
+              fi
+
+              echo "MEDIA_PREPARE_MODE=normalize_reencode"
+            fi
+
+            rm -f "$file_path"
+            file_path="$final_file"
+
+            echo "PREPARED_FILE=masked"
+
+            ensure_media_fits_telegram_limit "$file_path"
+            local fit_rc=$?
+
+            if [ "$fit_rc" -ne 0 ]; then
+              echo "Normalized file exceeded Telegram limit and could not be reduced safely. Trying a lower or alternate format."
+              return 2
+            fi
+
+            send_to_telegram "$file_path" "$success_height" "$attempt_label"
+            local send_rc=$?
+
+            if [ "$send_rc" -eq 0 ]; then
+              exit 0
+            fi
+
+            if [ "$send_rc" -eq 2 ]; then
+              echo "Normalized file exceeded Telegram limit. Trying a lower or alternate format."
+              return 2
+            fi
+
+            echo "Telegram send failed after successful normalized download."
+            exit 1
+          }
+
+          try_download() {
+            set +e
+
+            local attempt_label="$1"
+            local height="$2"
+            local format_selector="$3"
+            shift 3
+
+            local extra_args=("$@")
+            local log_file="work/yt-dlp-${attempt_label}-${height}.log"
+
+            echo ""
+            echo "=============================="
+            echo "ATTEMPT=${attempt_label}"
+            echo "TRY_HEIGHT=masked"
+            echo "FORMAT_SELECTOR=masked"
+            echo "=============================="
+
+            progress_stage "downloading" "40" "Downloading" "Downloading_media"
+
+            rm -f work/video.*
+
+            python3 -m yt_dlp \
+              --no-playlist \
+              --no-warnings \
+              --geo-bypass \
+              --socket-timeout 20 \
+              --retries 2 \
+              --fragment-retries 10 \
+              --retry-sleep fragment:linear=1:5 \
+              --concurrent-fragments "$CONCURRENT_FRAGMENTS" \
+              --merge-output-format mp4 \
+              --remux-video mp4 \
+              --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+              --referer "$REFERER_URL" \
+              --add-header "Accept-Language:en-US,en;q=0.9" \
+              "${YTDLP_MAX_FILESIZE_ARGS[@]}" \
+              -f "$format_selector" \
+              -o "work/video.%(ext)s" \
+              "${COOKIES_ARGS[@]}" \
+              "${extra_args[@]}" \
+              "$WORK_URL" > "$log_file" 2>&1
+            local rc=$?
+
+            print_log_safely "$log_file"
+
+            if is_dns_failure_log "$log_file"; then
+              echo "DNS_DOWNLOAD_FAILURE=1"
+              echo "DNS failure detected. Skipping remaining heights for this client."
+              return 90
+            fi
+
+            if [ "$rc" -ne 0 ] && is_rate_limit_log "$log_file" && [ "${ALLOW_RATE_LIMIT_RETRY:-1}" = "1" ]; then
+              echo "RATE_LIMIT_RETRY=1"
+              echo "RATE_LIMIT_RETRY_DELAY_SECONDS=4"
+              echo "RATE_LIMIT_RETRY_REASON=HTTP_429_TOO_MANY_REQUESTS"
+
+              progress_stage "rate_limited_retry" "42" "Retrying" "Rate_limited_retrying_in_4s"
+
+              sleep 4
+
+              ALLOW_RATE_LIMIT_RETRY=0 try_download "${attempt_label}-retry429" "$height" "$format_selector" "${extra_args[@]}"
+              return $?
+            fi
+
+            local file_path
+            file_path="$(find work -maxdepth 1 -type f -name "video.*" | head -n 1 || true)"
+
+            if [ "$rc" -eq 0 ] && [ -n "$file_path" ] && [ -f "$file_path" ]; then
+              handle_downloaded_file "$file_path" "$height" "$attempt_label"
+              return $?
+            fi
+
+            echo "DOWNLOAD_FAILED=1"
+            echo "ATTEMPT=${attempt_label}"
+            echo "HEIGHT=masked"
+            echo "RC=${rc}"
+
+            return 1
+          }
+
+          try_sorted_download() {
+            set +e
+
+            local attempt_label="$1"
+            local sort_expr="$2"
+            shift 2
+
+            local extra_args=("$@")
+            local log_file="work/yt-dlp-${attempt_label}.log"
+
+            echo ""
+            echo "=============================="
+            echo "ATTEMPT=${attempt_label}"
+            echo "SORT_EXPR=masked"
+            echo "=============================="
+
+            progress_stage "downloading" "40" "Downloading" "Downloading_media"
+
+            rm -f work/video.*
+
+            python3 -m yt_dlp \
+              --no-playlist \
+              --no-warnings \
+              --geo-bypass \
+              --socket-timeout 10 \
+              --retries 0 \
+              --fragment-retries 0 \
+              --concurrent-fragments "$CONCURRENT_FRAGMENTS" \
+              --merge-output-format mp4 \
+              --remux-video mp4 \
+              --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+              --referer "$REFERER_URL" \
+              --add-header "Accept-Language:en-US,en;q=0.9" \
+              "${YTDLP_MAX_FILESIZE_ARGS[@]}" \
+              -S "$sort_expr" \
+              -o "work/video.%(ext)s" \
+              "${COOKIES_ARGS[@]}" \
+              "${extra_args[@]}" \
+              "$WORK_URL" > "$log_file" 2>&1
+            local rc=$?
+
+            print_log_safely "$log_file"
+
+            if is_dns_failure_log "$log_file"; then
+              echo "DNS_DOWNLOAD_FAILURE=1"
+              echo "DNS failure detected in sorted fallback."
+              return 90
+            fi
+
+            if [ "$rc" -ne 0 ] && is_rate_limit_log "$log_file" && [ "${ALLOW_RATE_LIMIT_RETRY:-1}" = "1" ]; then
+              echo "RATE_LIMIT_RETRY=1"
+              echo "RATE_LIMIT_RETRY_DELAY_SECONDS=4"
+              echo "RATE_LIMIT_RETRY_REASON=HTTP_429_TOO_MANY_REQUESTS"
+
+              progress_stage "rate_limited_retry" "42" "Retrying" "Rate_limited_retrying_in_4s"
+
+              sleep 4
+
+              ALLOW_RATE_LIMIT_RETRY=0 try_sorted_download "${attempt_label}-retry429" "$sort_expr" "${extra_args[@]}"
+              return $?
+            fi
+
+            local file_path
+            file_path="$(find work -maxdepth 1 -type f -name "video.*" | head -n 1 || true)"
+
+            if [ "$rc" -eq 0 ] && [ -n "$file_path" ] && [ -f "$file_path" ]; then
+              handle_downloaded_file "$file_path" "sorted" "$attempt_label"
+              return $?
+            fi
+
+            echo "DOWNLOAD_FAILED=1"
+            echo "ATTEMPT=${attempt_label}"
+            echo "RC=${rc}"
+
+            return 1
+          }
+
+          if [ "$SEND_AS" = "document" ]; then
+            set +e
+            try_direct_document_download
+            DIRECT_DOCUMENT_RC=$?
+            set -e
+
+            if [ "$DIRECT_DOCUMENT_RC" -eq 0 ]; then
+              exit 0
+            fi
+
+            if [ "$PLATFORM" = "generic" ]; then
+              progress_stage "failed" "100" "Failed" "Direct_document_download_failed"
+              echo "FINAL_RESULT=failed"
+              echo "Direct document download failed. Generic document links will not be passed to yt-dlp."
+              exit 1
+            fi
+
+            echo "DIRECT_DOCUMENT_FALLBACK_TO_YTDLP=1"
+          fi
+
+          if [ "$IS_YOUTUBE" = "1" ]; then
+            echo "MODE=youtube"
+
+            progress_stage "extracting" "30" "Extracting" "Extracting_YouTube_media_info"
+
+            for CLIENT in default tv web_safari; do
+              EXTRA_ARGS=()
+
+              case "$CLIENT" in
+                default)
+                  ATTEMPT_LABEL="youtube-default-deno"
+                  ;;
+                tv)
+                  ATTEMPT_LABEL="youtube-tv-deno"
+                  EXTRA_ARGS+=(--extractor-args "youtube:player_client=tv")
+                  ;;
+                web_safari)
+                  ATTEMPT_LABEL="youtube-web-safari-deno"
+                  EXTRA_ARGS+=(--extractor-args "youtube:player_client=web_safari")
+                  ;;
+              esac
+
+              echo ""
+              echo "YOUTUBE_CLIENT=masked"
+
+              for HEIGHT in $HEIGHTS; do
+                FORMAT_SELECTOR="bv*[ext=mp4][vcodec^=avc1][height<=${HEIGHT}]+ba[ext=m4a]/bv*[ext=mp4][height<=${HEIGHT}]+ba[ext=m4a]/b[ext=mp4][height<=${HEIGHT}]/bv*[height<=${HEIGHT}]+ba/b[height<=${HEIGHT}]/b/best"
+
+                set +e
+                try_download "$ATTEMPT_LABEL" "$HEIGHT" "$FORMAT_SELECTOR" "${EXTRA_ARGS[@]}"
+                TRY_RC=$?
+                set -e
+
+                if [ "$TRY_RC" -eq 90 ]; then
+                  echo "DNS failure for ${CLIENT}. Moving to next YouTube client."
+                  break
+                fi
+              done
+            done
+          else
+            echo "MODE=generic"
+
+            progress_stage "extracting" "30" "Extracting" "Extracting_media_info"
+
+            generic_format_part_for_height() {
+              local height="$1"
+
+              if [ "$PLATFORM" = "tiktok" ]; then
+                printf '%s' "best[ext=mp4][height<=${height}][vcodec!=none][acodec!=none]/best[height<=${height}][vcodec!=none][acodec!=none]/bestvideo[height<=${height}]+bestaudio/best[ext=mp4][height<=${height}]/best[height<=${height}]"
+              else
+                printf '%s' "bestvideo[ext=mp4][height<=${height}]+bestaudio[ext=m4a]/best[ext=mp4][height<=${height}]/bestvideo[height<=${height}]+bestaudio/best[height<=${height}]"
+              fi
+            }
+
+            generic_highest_format_part() {
+              if [ "$PLATFORM" = "tiktok" ]; then
+                printf '%s' "best[ext=mp4][vcodec!=none][acodec!=none]/best[vcodec!=none][acodec!=none]/bestvideo[ext=mp4]+bestaudio/bestvideo+bestaudio/best[ext=mp4]/best"
+              else
+                printf '%s' "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/bestvideo+bestaudio/best"
+              fi
+            }
+
+            append_selector_part() {
+              local current="$1"
+              local part="$2"
+
+              if [ -z "$current" ]; then
+                printf '%s' "$part"
+              else
+                printf '%s/%s' "$current" "$part"
+              fi
+            }
+
+            build_generic_selector_from_order() {
+              local selector=""
+              local item=""
+              local part=""
+
+              for item in "$@"; do
+                if [ "$item" = "highest" ]; then
+                  part="$(generic_highest_format_part)"
+                else
+                  part="$(generic_format_part_for_height "$item")"
+                fi
+
+                selector="$(append_selector_part "$selector" "$part")"
+              done
+
+              printf '%s' "$selector"
+            }
+
+            next_higher_height() {
+              case "$MAX_HEIGHT_NUM" in
+                360)
+                  echo "480"
+                  ;;
+                480)
+                  echo "720"
+                  ;;
+                720)
+                  echo "1080"
+                  ;;
+                1080)
+                  echo "1440"
+                  ;;
+                1440)
+                  echo "2160"
+                  ;;
+                *)
+                  echo ""
+                  ;;
+              esac
+            }
+
+            if [ "$PLATFORM" = "tiktok" ]; then
+              echo "TIKTOK_AUDIO_SAFE_MODE=1"
+
+              if [ "$AUTO_MODE" = "1" ]; then
+                TIKTOK_ORDER_LIST="highest $HEIGHTS"
+              else
+                TIKTOK_ORDER_LIST="$HEIGHTS highest"
+              fi
+
+              TIKTOK_AUDIO_SELECTOR="$(build_generic_selector_from_order $TIKTOK_ORDER_LIST)"
+
+              set +e
+              try_download "tiktok-audio-safe" "audio" "$TIKTOK_AUDIO_SELECTOR"
+              TRY_RC=$?
+              set -e
+
+              if [ "$TRY_RC" -eq 90 ]; then
+                echo "DNS failure in TikTok audio safe attempt."
+              fi
+
+              set +e
+              try_sorted_download "tiktok-sorted-hasaud" "hasaud,res,fps,tbr"
+              TRY_RC=$?
+              set -e
+
+              if [ "$TRY_RC" -eq 90 ]; then
+                echo "DNS failure in TikTok sorted audio attempt."
+              fi
+
+              set +e
+              try_download "tiktok-best-audio-fallback" "best" "best[acodec!=none][vcodec!=none]/best[ext=mp4][acodec!=none][vcodec!=none]/bestvideo+bestaudio/best"
+              TRY_RC=$?
+              set -e
+
+              if [ "$TRY_RC" -eq 90 ]; then
+                echo "DNS failure in TikTok best audio fallback."
+              fi
+            fi
+
+            if [ "$AUTO_MODE" = "1" ]; then
+              echo "GENERIC_AUTO_ORDER=highest"
+
+              FORMAT_SELECTOR="$(build_generic_selector_from_order highest)"
+
+              set +e
+              try_download "generic-auto-highest" "highest" "$FORMAT_SELECTOR"
+              TRY_RC=$?
+              set -e
+
+              if [ "$TRY_RC" -eq 90 ]; then
+                echo "DNS failure in generic auto highest."
+              elif [ "$TRY_RC" -ne 0 ]; then
+                echo "GENERIC_FORCE_EXTRACTOR_FALLBACK=1"
+
+                set +e
+                try_download "generic-force-fallback" "highest" "$FORMAT_SELECTOR" --force-generic-extractor
+                TRY_RC=$?
+                set -e
+
+                if [ "$TRY_RC" -eq 90 ]; then
+                  echo "DNS failure in generic force extractor fallback."
+                fi
+              fi
+            else
+              NEXT_HIGHER_HEIGHT="$(next_higher_height)"
+              ORDER_LIST="$HEIGHTS"
+
+              if [ -n "$NEXT_HIGHER_HEIGHT" ]; then
+                ORDER_LIST="$ORDER_LIST $NEXT_HIGHER_HEIGHT"
+              fi
+
+              ORDER_LIST="$ORDER_LIST highest"
+
+              echo "GENERIC_SELECTED_ORDER=masked"
+
+              FORMAT_SELECTOR="$(build_generic_selector_from_order $ORDER_LIST)"
+
+              set +e
+              try_download "generic-ordered-single-pass" "$MAX_HEIGHT_NUM" "$FORMAT_SELECTOR"
+              TRY_RC=$?
+              set -e
+
+              if [ "$TRY_RC" -eq 90 ]; then
+                echo "DNS failure in generic ordered single pass."
+              elif [ "$TRY_RC" -ne 0 ]; then
+                echo "GENERIC_FORCE_EXTRACTOR_FALLBACK=1"
+
+                set +e
+                try_download "generic-force-fallback" "$MAX_HEIGHT_NUM" "$FORMAT_SELECTOR" --force-generic-extractor
+                TRY_RC=$?
+                set -e
+
+                if [ "$TRY_RC" -eq 90 ]; then
+                  echo "DNS failure in generic force extractor fallback."
+                fi
+              fi
+            fi
+          fi
+
+          progress_stage "failed" "100" "Failed" "No_working_download_method_succeeded"
+
+          echo "FINAL_RESULT=failed"
+          echo "No working download method succeeded."
+          exit 1
